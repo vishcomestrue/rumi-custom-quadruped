@@ -29,10 +29,14 @@ class MultiMotorController:
     ADDR_TORQUE_ENABLE = 64
     ADDR_GOAL_POSITION = 116
     ADDR_PRESENT_POSITION = 132
+    ADDR_PRESENT_CURRENT = 126  # Power measurement
+    ADDR_PRESENT_VOLTAGE = 144  # Power measurement
 
     # Data Byte Length
     LEN_GOAL_POSITION = 4
     LEN_PRESENT_POSITION = 4
+    LEN_PRESENT_CURRENT = 2  # Power measurement
+    LEN_PRESENT_VOLTAGE = 2  # Power measurement
 
     # Protocol and Communication Settings
     PROTOCOL_VERSION = 2.0
@@ -91,6 +95,20 @@ class MultiMotorController:
             'write_errors': 0,
         }
 
+        # Power measurement support
+        self.power_measurement_supported = False
+        self.motor_models = {}  # {motor_id: model_number}
+        self.group_sync_read_power = None
+
+        # Power statistics accumulators
+        self.power_stats = {
+            'current_samples': [],
+            'voltage_samples': [],
+            'power_samples': [],
+            'sample_count': 0,
+            'start_time': None,
+        }
+
         print(f"[Multi-Motor Controller] Initialized for {self.num_motors} motor(s)")
         print(f"[Multi-Motor Controller] Port: {port}")
         print(f"[Multi-Motor Controller] Baudrate: {self.BAUDRATE} bps")
@@ -123,6 +141,33 @@ class MultiMotorController:
                 for motor_id in motor_ids:
                     model_num, fw_version = data_list[motor_id]
                     print(f"  Motor ID {motor_id}: Model {model_num}, Firmware v{fw_version}")
+                    # Store model numbers for power measurement support detection
+                    self.motor_models[motor_id] = model_num
+
+            # Detect power measurement support
+            if len(motor_ids) > 0:
+                supported_models = []
+                unsupported_models = []
+
+                for motor_id in motor_ids:
+                    model_num = self.motor_models[motor_id]
+                    # Protocol 2.0 motors with current sensing: model number >= 300
+                    if model_num >= 300:
+                        supported_models.append(motor_id)
+                    else:
+                        unsupported_models.append((motor_id, model_num))
+
+                if len(unsupported_models) > 0:
+                    print(f"\n[Power Measurement] NOT SUPPORTED")
+                    print(f"  {len(unsupported_models)} motor(s) do not support current sensing:")
+                    for motor_id, model_num in unsupported_models:
+                        print(f"    Motor ID {motor_id}: Model {model_num}")
+                    print(f"  Power measurement will be DISABLED.")
+                    self.power_measurement_supported = False
+                else:
+                    print(f"\n[Power Measurement] SUPPORTED")
+                    print(f"  All {len(motor_ids)} motor(s) support current/voltage sensing")
+                    self.power_measurement_supported = True
 
             return motor_ids
 
@@ -212,6 +257,27 @@ class MultiMotorController:
                 print(f"[ERROR] Failed to add motor {motor_id} to sync read group")
                 return False
         print(f"[SUCCESS] All {self.num_motors} motors added to sync read group")
+
+        # Initialize power measurement if supported
+        if self.power_measurement_supported:
+            print(f"\n[INFO] Initializing power measurement...")
+
+            # Read 20 bytes from address 126 to cover Current(126-127) and Voltage(144-145)
+            self.group_sync_read_power = GroupSyncRead(
+                self.port_handler,
+                self.packet_handler,
+                self.ADDR_PRESENT_CURRENT,
+                20
+            )
+
+            for motor_id in self.motor_ids:
+                if not self.group_sync_read_power.addParam(motor_id):
+                    print(f"[ERROR] Failed to add motor {motor_id} to power sync read")
+                    self.power_measurement_supported = False
+                    return False
+
+            print(f"[SUCCESS] Power measurement initialized")
+            self.power_stats['start_time'] = time.time()
 
         self.connected = True
         print(f"\n{'='*50}")
@@ -419,6 +485,102 @@ class MultiMotorController:
 
         return positions_rad
 
+    def read_power_measurements(self):
+        """
+        Read current and voltage from all motors for power calculation.
+
+        This is separate from position reading and can be called less frequently
+        to minimize performance impact.
+
+        Returns:
+            dict: {
+                'total_current_A': float,      # Sum of all motor currents in Amperes
+                'avg_voltage_V': float,         # Average voltage across motors in Volts
+                'total_power_W': float,         # Total power consumption in Watts
+                'per_motor': {                  # Per-motor breakdown
+                    motor_id: {
+                        'current_A': float,
+                        'voltage_V': float,
+                        'power_W': float
+                    }
+                }
+            } or None if error or not supported
+        """
+        if not self.power_measurement_supported or not self.connected:
+            return None
+
+        # Send read request for current and voltage
+        result = self.group_sync_read_power.txRxPacket()
+
+        if result != COMM_SUCCESS:
+            # Don't print error for power reads (non-critical)
+            return None
+
+        # Extract data for each motor
+        measurements = {}
+        total_current = 0.0
+        total_voltage = 0.0
+
+        for motor_id in self.motor_ids:
+            # Check if data is available
+            if not self.group_sync_read_power.isAvailable(
+                motor_id,
+                self.ADDR_PRESENT_CURRENT,
+                self.LEN_PRESENT_CURRENT
+            ):
+                return None  # Data not available, skip this sample
+
+            # Read Present Current (126, 2 bytes, signed)
+            raw_current = self.group_sync_read_power.getData(
+                motor_id,
+                self.ADDR_PRESENT_CURRENT,
+                self.LEN_PRESENT_CURRENT
+            )
+
+            # Convert to signed 16-bit (two's complement)
+            if raw_current > 32767:
+                raw_current = raw_current - 65536
+
+            # Convert to Amperes: raw * 2.69 mA per unit
+            current_A = (raw_current * 2.69) / 1000.0
+
+            # Read Present Voltage (144, 2 bytes, unsigned)
+            raw_voltage = self.group_sync_read_power.getData(
+                motor_id,
+                self.ADDR_PRESENT_VOLTAGE,
+                self.LEN_PRESENT_VOLTAGE
+            )
+
+            # Convert to Volts: raw * 0.1 V per unit
+            voltage_V = raw_voltage * 0.1
+
+            # Calculate power for this motor
+            power_W = voltage_V * abs(current_A)  # Use abs for power calculation
+
+            # Store per-motor measurements
+            measurements[motor_id] = {
+                'current_A': current_A,
+                'voltage_V': voltage_V,
+                'power_W': power_W
+            }
+
+            total_current += abs(current_A)  # Sum absolute values for total current
+            total_voltage += voltage_V
+
+        # Calculate averages
+        num_motors = len(self.motor_ids)
+        avg_voltage = total_voltage / num_motors if num_motors > 0 else 0.0
+
+        # Calculate total power (sum of individual powers)
+        total_power = sum(m['power_W'] for m in measurements.values())
+
+        return {
+            'total_current_A': total_current,
+            'avg_voltage_V': avg_voltage,
+            'total_power_W': total_power,
+            'per_motor': measurements
+        }
+
     def disconnect(self):
         """Disable torque for all motors and close port."""
         if self.connected:
@@ -437,6 +599,10 @@ class MultiMotorController:
         # Clear sync read parameters
         self.group_sync_read.clearParam()
 
+        # Clear power sync read parameters if initialized
+        if self.group_sync_read_power is not None:
+            self.group_sync_read_power.clearParam()
+
         # Close port
         self.port_handler.closePort()
         self.connected = False
@@ -454,6 +620,47 @@ class MultiMotorController:
                 print(f"  Read success rate:  {100*(1-self.stats['read_errors']/self.stats['read_count']):.2f}%")
             if self.stats['write_count'] > 0:
                 print(f"  Write success rate: {100*(1-self.stats['write_errors']/self.stats['write_count']):.2f}%")
+
+            # Power statistics
+            if self.power_measurement_supported and self.power_stats['sample_count'] > 0:
+                print(f"\n[POWER STATISTICS] Electrical Measurements:")
+                print(f"  Samples collected: {self.power_stats['sample_count']}")
+
+                # Current statistics
+                avg_current = sum(self.power_stats['current_samples']) / len(self.power_stats['current_samples'])
+                min_current = min(self.power_stats['current_samples'])
+                max_current = max(self.power_stats['current_samples'])
+                print(f"  Total Current:")
+                print(f"    Average: {avg_current:.3f} A")
+                print(f"    Min:     {min_current:.3f} A")
+                print(f"    Max:     {max_current:.3f} A")
+
+                # Voltage statistics
+                avg_voltage = sum(self.power_stats['voltage_samples']) / len(self.power_stats['voltage_samples'])
+                min_voltage = min(self.power_stats['voltage_samples'])
+                max_voltage = max(self.power_stats['voltage_samples'])
+                print(f"  Average Voltage:")
+                print(f"    Average: {avg_voltage:.2f} V")
+                print(f"    Min:     {min_voltage:.2f} V")
+                print(f"    Max:     {max_voltage:.2f} V")
+
+                # Power statistics
+                avg_power = sum(self.power_stats['power_samples']) / len(self.power_stats['power_samples'])
+                min_power = min(self.power_stats['power_samples'])
+                max_power = max(self.power_stats['power_samples'])
+                print(f"  Total Power:")
+                print(f"    Average: {avg_power:.2f} W")
+                print(f"    Min:     {min_power:.2f} W")
+                print(f"    Max:     {max_power:.2f} W")
+
+                # Energy calculation
+                if self.power_stats['start_time'] is not None:
+                    elapsed_hours = (time.time() - self.power_stats['start_time']) / 3600.0
+                    energy_Wh = avg_power * elapsed_hours
+                    print(f"  Total Energy:")
+                    print(f"    Estimated: {energy_Wh:.3f} Wh ({energy_Wh*1000:.1f} mWh)")
+                    print(f"    Session duration: {elapsed_hours*60:.2f} minutes")
+
             print(f"{'='*50}\n")
 
 
@@ -596,6 +803,18 @@ def test_motors(num_motors=3, control_rate=100, port="/dev/ttyUSB0", baudrate=20
             time.sleep(sleep_time)
 
             iteration += 1
+
+            # Sample power measurements periodically
+            # Only every 10 iterations to minimize performance impact
+            POWER_SAMPLE_INTERVAL = 10
+            if controller.power_measurement_supported and (iteration % POWER_SAMPLE_INTERVAL == 0):
+                power_data = controller.read_power_measurements()
+                if power_data is not None:
+                    # Accumulate samples for statistics
+                    controller.power_stats['current_samples'].append(power_data['total_current_A'])
+                    controller.power_stats['voltage_samples'].append(power_data['avg_voltage_V'])
+                    controller.power_stats['power_samples'].append(power_data['total_power_W'])
+                    controller.power_stats['sample_count'] += 1
 
     except KeyboardInterrupt:
         print("\n\n[INFO] Stopping test...")
