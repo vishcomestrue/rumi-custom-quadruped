@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""
+Multi-Motor Dynamixel Controller
+Controls multiple Dynamixel motors simultaneously at high frequency.
+Easily scalable from 3 to 12+ motors.
+
+Architecture:
+- GroupSyncWrite: Write all motor positions in ONE packet
+- GroupSyncRead: Read all motor positions in ONE packet
+- Achieves 80-120Hz control frequency
+
+Usage:
+    # For 3 motors
+    controller = MultiMotorController(motor_ids=[1, 2, 3])
+
+    # For 12 motors
+    controller = MultiMotorController(motor_ids=list(range(1, 13)))
+"""
+
+import math
+import time
+from dynamixel_sdk import *
+
+
+class MultiMotorController:
+    """High-performance controller for multiple Dynamixel motors using Protocol 2.0."""
+
+    # Control Table Addresses (MX-64/X-Series with Protocol 2.0)
+    ADDR_TORQUE_ENABLE = 64
+    ADDR_GOAL_POSITION = 116
+    ADDR_PRESENT_POSITION = 132
+
+    # Data Byte Length
+    LEN_GOAL_POSITION = 4
+    LEN_PRESENT_POSITION = 4
+
+    # Protocol and Communication Settings
+    PROTOCOL_VERSION = 2.0
+    BAUDRATE = 2000000  # 2Mbps for high-speed communication
+
+    # Motor position range
+    DXL_MINIMUM_POSITION = 0
+    DXL_MAXIMUM_POSITION = 4095
+    DXL_CENTER_POSITION = 2048  # Center position (0 radians)
+
+    # Communication result values
+    COMM_SUCCESS = 0
+    TORQUE_ENABLE = 1
+    TORQUE_DISABLE = 0
+
+    def __init__(self, port="/dev/ttyUSB0", motor_ids=[1, 2, 3], baudrate=2000000):
+        """
+        Initialize Multi-Motor controller.
+
+        Args:
+            port: Serial port path (e.g., "/dev/ttyUSB0")
+            motor_ids: List of motor IDs to control (e.g., [1, 2, 3] or list(range(1, 13)))
+            baudrate: Communication baudrate (default: 2Mbps)
+        """
+        self.port = port
+        self.motor_ids = motor_ids
+        self.num_motors = len(motor_ids)
+        self.BAUDRATE = baudrate
+        self.connected = False
+
+        # Initialize port and packet handlers
+        self.port_handler = PortHandler(self.port)
+        self.packet_handler = PacketHandler(self.PROTOCOL_VERSION)
+
+        # Initialize GroupSyncRead for efficient multi-motor reading
+        self.group_sync_read = GroupSyncRead(
+            self.port_handler,
+            self.packet_handler,
+            self.ADDR_PRESENT_POSITION,
+            self.LEN_PRESENT_POSITION
+        )
+
+        # Initialize GroupSyncWrite for efficient multi-motor writing
+        self.group_sync_write = GroupSyncWrite(
+            self.port_handler,
+            self.packet_handler,
+            self.ADDR_GOAL_POSITION,
+            self.LEN_GOAL_POSITION
+        )
+
+        # Statistics
+        self.stats = {
+            'read_count': 0,
+            'write_count': 0,
+            'read_errors': 0,
+            'write_errors': 0,
+        }
+
+        print(f"[Multi-Motor Controller] Initialized for {self.num_motors} motors: {motor_ids}")
+        print(f"[Multi-Motor Controller] Port: {port}")
+        print(f"[Multi-Motor Controller] Baudrate: {self.BAUDRATE} bps")
+
+    def connect(self):
+        """
+        Open serial port, set baudrate, and enable torque for all motors.
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        # Open port
+        if not self.port_handler.openPort():
+            print(f"[ERROR] Failed to open port {self.port}")
+            return False
+        print(f"[SUCCESS] Opened port {self.port}")
+
+        # Set baudrate
+        if not self.port_handler.setBaudRate(self.BAUDRATE):
+            print(f"[ERROR] Failed to set baudrate to {self.BAUDRATE}")
+            return False
+        print(f"[SUCCESS] Set baudrate to {self.BAUDRATE}")
+
+        # Enable torque for all motors
+        print(f"\n[INFO] Enabling torque for {self.num_motors} motors...")
+        for motor_id in self.motor_ids:
+            result, error = self.packet_handler.write1ByteTxRx(
+                self.port_handler,
+                motor_id,
+                self.ADDR_TORQUE_ENABLE,
+                self.TORQUE_ENABLE
+            )
+
+            if result != COMM_SUCCESS:
+                print(f"[ERROR] Motor ID {motor_id}: {self.packet_handler.getTxRxResult(result)}")
+                return False
+            elif error != 0:
+                print(f"[ERROR] Motor ID {motor_id}: {self.packet_handler.getRxPacketError(error)}")
+                return False
+
+            print(f"  Motor ID {motor_id}: Torque enabled ✓")
+
+        # Add all motors to sync read group (only done once)
+        print(f"\n[INFO] Adding motors to sync read group...")
+        for motor_id in self.motor_ids:
+            if not self.group_sync_read.addParam(motor_id):
+                print(f"[ERROR] Failed to add motor {motor_id} to sync read group")
+                return False
+        print(f"[SUCCESS] All {self.num_motors} motors added to sync read group")
+
+        self.connected = True
+        print(f"\n{'='*50}")
+        print(f"[READY] All {self.num_motors} motors connected and ready!")
+        print(f"{'='*50}\n")
+        return True
+
+    def write_positions(self, positions_dict):
+        """
+        Write goal positions to all motors simultaneously in ONE packet.
+
+        Args:
+            positions_dict: Dictionary mapping motor_id to position in Dynamixel units
+                           Example: {1: 2048, 2: 3000, 3: 1500}
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not self.connected:
+            print("[ERROR] Not connected to motors")
+            return False
+
+        self.stats['write_count'] += 1
+
+        # Add parameters for each motor
+        for motor_id in self.motor_ids:
+            if motor_id not in positions_dict:
+                print(f"[WARNING] Position not provided for motor {motor_id}, skipping")
+                continue
+
+            position = positions_dict[motor_id]
+
+            # Clamp position to valid range
+            position = max(self.DXL_MINIMUM_POSITION,
+                          min(self.DXL_MAXIMUM_POSITION, position))
+
+            # Convert position to 4-byte array
+            param_goal_position = [
+                DXL_LOBYTE(DXL_LOWORD(position)),
+                DXL_HIBYTE(DXL_LOWORD(position)),
+                DXL_LOBYTE(DXL_HIWORD(position)),
+                DXL_HIBYTE(DXL_HIWORD(position))
+            ]
+
+            # Add to sync write buffer
+            if not self.group_sync_write.addParam(motor_id, param_goal_position):
+                print(f"[ERROR] Failed to add motor {motor_id} to sync write")
+                self.group_sync_write.clearParam()
+                self.stats['write_errors'] += 1
+                return False
+
+        # Send all commands in ONE packet
+        result = self.group_sync_write.txPacket()
+
+        # Clear parameters for next write
+        self.group_sync_write.clearParam()
+
+        if result != COMM_SUCCESS:
+            print(f"[ERROR] Sync write failed: {self.packet_handler.getTxRxResult(result)}")
+            self.stats['write_errors'] += 1
+            return False
+
+        return True
+
+    def read_positions(self, max_retries=3):
+        """
+        Read current positions from all motors simultaneously in ONE packet.
+
+        Args:
+            max_retries: Maximum number of retry attempts on failure (default: 3)
+
+        Returns:
+            dict: {motor_id: position_in_dynamixel_units} or None if error
+                  Example: {1: 2048, 2: 3000, 3: 1500}
+        """
+        if not self.connected:
+            print("[ERROR] Not connected to motors")
+            return None
+
+        self.stats['read_count'] += 1
+
+        # Retry loop for transient errors
+        for attempt in range(max_retries):
+            # Send read request and receive responses in ONE transaction
+            result = self.group_sync_read.txRxPacket()
+
+            if result != COMM_SUCCESS:
+                if attempt < max_retries - 1:
+                    # Retry on failure
+                    time.sleep(0.001)  # Small delay before retry
+                    continue
+                else:
+                    # Final attempt failed
+                    print(f"[ERROR] Sync read failed after {max_retries} attempts: {self.packet_handler.getTxRxResult(result)}")
+                    self.stats['read_errors'] += 1
+                    return None
+
+            # Extract position data for each motor
+            positions = {}
+            all_available = True
+
+            for motor_id in self.motor_ids:
+                # Check if data is available
+                if not self.group_sync_read.isAvailable(
+                    motor_id,
+                    self.ADDR_PRESENT_POSITION,
+                    self.LEN_PRESENT_POSITION
+                ):
+                    if attempt < max_retries - 1:
+                        # Data not available, retry
+                        all_available = False
+                        time.sleep(0.001)
+                        break
+                    else:
+                        print(f"[ERROR] Data not available for motor {motor_id} after {max_retries} attempts")
+                        self.stats['read_errors'] += 1
+                        return None
+
+                # Get position data
+                position = self.group_sync_read.getData(
+                    motor_id,
+                    self.ADDR_PRESENT_POSITION,
+                    self.LEN_PRESENT_POSITION
+                )
+                positions[motor_id] = position
+
+            # If all data available, return success
+            if all_available:
+                return positions
+
+        # Should not reach here, but handle gracefully
+        self.stats['read_errors'] += 1
+        return None
+
+    def radians_to_dynamixel(self, radians):
+        """
+        Convert radians to Dynamixel position units.
+
+        Args:
+            radians: Position in radians
+
+        Returns:
+            int: Position in Dynamixel units (0-4095)
+        """
+        # Center position (2048) = 0 radians
+        # Full range: 0-4095 = -π to +π radians
+        position = int((radians * 2048 / math.pi) + self.DXL_CENTER_POSITION)
+
+        # Clamp to valid range
+        position = max(self.DXL_MINIMUM_POSITION,
+                      min(self.DXL_MAXIMUM_POSITION, position))
+
+        return position
+
+    def dynamixel_to_radians(self, dxl_position):
+        """
+        Convert Dynamixel position units to radians.
+
+        Args:
+            dxl_position: Position in Dynamixel units (0-4095)
+
+        Returns:
+            float: Position in radians
+        """
+        radians = (dxl_position - self.DXL_CENTER_POSITION) * math.pi / 2048
+        return radians
+
+    def write_positions_radians(self, positions_rad_dict):
+        """
+        Write positions in radians to all motors.
+
+        Args:
+            positions_rad_dict: Dictionary mapping motor_id to position in radians
+                               Example: {1: 0.0, 2: 0.5, 3: -0.3}
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        # Convert radians to Dynamixel units
+        positions_dxl = {
+            motor_id: self.radians_to_dynamixel(rad_pos)
+            for motor_id, rad_pos in positions_rad_dict.items()
+        }
+
+        return self.write_positions(positions_dxl)
+
+    def read_positions_radians(self):
+        """
+        Read current positions from all motors in radians.
+
+        Returns:
+            dict: {motor_id: position_in_radians} or None if error
+                  Example: {1: 0.0, 2: 0.5, 3: -0.3}
+        """
+        positions_dxl = self.read_positions()
+
+        if positions_dxl is None:
+            return None
+
+        # Convert Dynamixel units to radians
+        positions_rad = {
+            motor_id: self.dynamixel_to_radians(dxl_pos)
+            for motor_id, dxl_pos in positions_dxl.items()
+        }
+
+        return positions_rad
+
+    def disconnect(self):
+        """Disable torque for all motors and close port."""
+        if self.connected:
+            print(f"\n[INFO] Disabling torque for {self.num_motors} motors...")
+
+            # Disable torque for all motors
+            for motor_id in self.motor_ids:
+                self.packet_handler.write1ByteTxRx(
+                    self.port_handler,
+                    motor_id,
+                    self.ADDR_TORQUE_ENABLE,
+                    self.TORQUE_DISABLE
+                )
+            print("[SUCCESS] Torque disabled for all motors")
+
+        # Clear sync read parameters
+        self.group_sync_read.clearParam()
+
+        # Close port
+        self.port_handler.closePort()
+        self.connected = False
+        print("[SUCCESS] Port closed")
+
+        # Print statistics
+        if self.stats['read_count'] > 0 or self.stats['write_count'] > 0:
+            print(f"\n{'='*50}")
+            print(f"[STATISTICS] Session Summary:")
+            print(f"  Total reads:  {self.stats['read_count']}")
+            print(f"  Total writes: {self.stats['write_count']}")
+            print(f"  Read errors:  {self.stats['read_errors']}")
+            print(f"  Write errors: {self.stats['write_errors']}")
+            if self.stats['read_count'] > 0:
+                print(f"  Read success rate:  {100*(1-self.stats['read_errors']/self.stats['read_count']):.2f}%")
+            if self.stats['write_count'] > 0:
+                print(f"  Write success rate: {100*(1-self.stats['write_errors']/self.stats['write_count']):.2f}%")
+            print(f"{'='*50}\n")
+
+
+def test_motors(num_motors=3, control_rate=100, port="/dev/ttyUSB0", baudrate=2000000,
+                write_read_delay=0.0005, step_size=40):
+    """
+    Test script for N motors with stepped position sequence.
+    Moves through: 0 → step → 2×step → ... → 4000 → ... → step → (loop)
+
+    Args:
+        num_motors: Number of motors to control (default: 3)
+        control_rate: Target control frequency in Hz (default: 100)
+        port: Serial port (default: "/dev/ttyUSB0")
+        baudrate: Communication baudrate (default: 2000000)
+        write_read_delay: Delay between write and read in seconds (default: 0.0005 = 0.5ms)
+        step_size: Position step size in Dynamixel units (default: 40)
+    """
+    print("\n" + "="*70)
+    print(f"MULTI-MOTOR CONTROLLER TEST - {num_motors} MOTORS")
+    print("="*70)
+    print(f"Motors: IDs 1-{num_motors}")
+    print(f"Target control rate: {control_rate} Hz")
+    print(f"Port: {port}")
+    print(f"Baudrate: {baudrate} bps")
+    print("Make sure motors are connected and powered!")
+    print("="*70 + "\n")
+
+    # Create controller for specified number of motors
+    motor_ids = list(range(1, num_motors + 1))
+    controller = MultiMotorController(
+        port=port,
+        motor_ids=motor_ids,
+        baudrate=baudrate
+    )
+
+    # Connect to motors
+    if not controller.connect():
+        print("\n[FAILED] Could not connect to motors. Exiting...")
+        return
+
+    print(f"[INFO] Starting motor movement test...")
+    print(f"[INFO] {num_motors} motors will move through stepped positions")
+    print(f"[INFO] Pattern: 0 → {step_size} → {step_size*2} → ... → 4000 → ... → {step_size} → (loop)")
+    print(f"[INFO] Step size: {step_size} units (~{step_size*0.088:.2f}°)")
+    print(f"[INFO] Target frequency: {control_rate} Hz")
+
+    # Warm up communication with a few test reads
+    print(f"[INFO] Warming up communication...")
+    for i in range(3):
+        test_pos = controller.read_positions()
+        if test_pos is None:
+            print(f"[WARNING] Warm-up read {i+1}/3 failed, retrying...")
+            time.sleep(0.01)
+        else:
+            print(f"  Warm-up read {i+1}/3: OK")
+            break
+
+    print(f"[INFO] Press Ctrl+C to stop\n")
+
+    # Calculate sleep time to achieve target control rate
+    # Sleep time = (1/control_rate) - expected_loop_time
+    # Assume ~5ms for communication overhead
+    target_period = 1.0 / control_rate
+    comm_overhead = 0.005  # 5ms estimated
+    sleep_time = max(0.001, target_period - comm_overhead)  # Minimum 1ms
+
+    try:
+        loop_times = []
+        iteration = 0
+
+        # Define position sequence using configurable step size
+        max_position = 4000
+
+        # Generate sequence: going up from 0 to 4000
+        up_sequence = list(range(0, max_position + 1, step_size))
+        # Generate sequence: going down from (max-step) to step (avoiding repeat of max and 0)
+        down_sequence = list(range(max_position - step_size, 0, -step_size))
+
+        position_sequence = up_sequence + down_sequence
+        sequence_index = 0
+
+        # Print compact representation
+        print(f"[INFO] Position sequence: 0 → {step_size} → {step_size*2} → ... → {max_position} → {max_position-step_size} → ... → {step_size} → (loop)")
+        print(f"[INFO] Step size: {step_size} units (~{step_size*0.088:.2f}°)")
+        print(f"[INFO] Total positions per cycle: {len(position_sequence)}")
+        print(f"[INFO] Full cycle time at {control_rate}Hz: {len(position_sequence)/control_rate:.2f} seconds\n")
+
+        while True:
+            loop_start = time.time()
+
+            # Get current target position from sequence (in Dynamixel units)
+            target_position_dxl = position_sequence[sequence_index]
+
+            # Create positions dict for all motors (all motors move to same position)
+            positions_dxl = {}
+            for motor_id in motor_ids:
+                positions_dxl[motor_id] = target_position_dxl
+
+            # Write positions to all motors (ONE packet)
+            success = controller.write_positions(positions_dxl)
+            if not success:
+                print("\n[ERROR] Write failed!")
+                break
+
+            # Small delay between write and read (helps with packet timing)
+            if write_read_delay > 0:
+                time.sleep(write_read_delay)
+
+            # Read current positions from all motors (ONE packet)
+            current_positions = controller.read_positions()
+            if current_positions is None:
+                print("\n[ERROR] Read failed!")
+                break
+
+            # Calculate loop time and frequency
+            loop_end = time.time()
+            loop_time_ms = (loop_end - loop_start) * 1000
+            loop_times.append(loop_time_ms)
+            frequency = 1000.0 / loop_time_ms if loop_time_ms > 0 else 0
+
+            # Print status every iteration (or every N iterations for high frequency)
+            # print_interval = 1 if control_rate <= 20 else 10
+            # if iteration % print_interval == 0:
+            #     status = f"Step {sequence_index+1}/{len(position_sequence)} | "
+            #     status += f"Target: {target_position_dxl:4d} | "
+            #     status += f"Loop: {loop_time_ms:6.2f}ms ({frequency:6.1f}Hz) | "
+
+            #     # Show motor positions based on number of motors
+            #     if num_motors <= 3:
+            #         # Show all motors with target→actual
+            #         for motor_id in motor_ids:
+            #             status += f"M{motor_id}:{target_position_dxl:4d}→{current_positions[motor_id]:4d} "
+            #     elif num_motors <= 6:
+            #         # Show all motors in compact format
+            #         for motor_id in motor_ids:
+            #             status += f"M{motor_id}:{current_positions[motor_id]:4d} "
+            #     else:
+            #         # Show first 3 and last 3 motors
+            #         for motor_id in motor_ids[:3]:
+            #             status += f"M{motor_id}:{current_positions[motor_id]:4d} "
+            #         status += "... "
+            #         for motor_id in motor_ids[-3:]:
+            #             status += f"M{motor_id}:{current_positions[motor_id]:4d} "
+
+            #     print(status)
+
+            # Control loop timing - sleep to achieve target rate
+            time.sleep(sleep_time)
+
+            # Move to next position in sequence (loop back to start)
+            sequence_index = (sequence_index + 1) % len(position_sequence)
+            iteration += 1
+
+    except KeyboardInterrupt:
+        print("\n\n[INFO] Stopping test...")
+
+        # Calculate and print performance statistics
+        if loop_times:
+            avg_time = sum(loop_times) / len(loop_times)
+            min_time = min(loop_times)
+            max_time = max(loop_times)
+            avg_freq = 1000.0 / avg_time
+
+            print(f"\n{'='*70}")
+            print("[PERFORMANCE] Statistics:")
+            print(f"  Target frequency:  {control_rate:.1f} Hz")
+            print(f"  Actual frequency:  {avg_freq:.1f} Hz")
+            print(f"  Average loop time: {avg_time:.2f} ms")
+            print(f"  Min loop time:     {min_time:.2f} ms ({1000.0/min_time:.1f} Hz)")
+            print(f"  Max loop time:     {max_time:.2f} ms ({1000.0/max_time:.1f} Hz)")
+            print(f"  Total loops:       {len(loop_times)}")
+            print(f"  Frequency error:   {avg_freq - control_rate:+.1f} Hz ({100*(avg_freq - control_rate)/control_rate:+.1f}%)")
+            print(f"{'='*70}")
+
+    finally:
+        controller.disconnect()
+        print("\n[COMPLETE] Test finished\n")
+
+
+if __name__ == "__main__":
+    """Main entry point with command-line argument parsing."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Multi-Motor Dynamixel Controller - Test multiple motors at desired frequency",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Test 3 motors at 100Hz (default)
+  python3 multi_motor_controller.py
+
+  # Test 12 motors at 100Hz
+  python3 multi_motor_controller.py -n 12
+
+  # Test 6 motors at 50Hz
+  python3 multi_motor_controller.py -n 6 -r 50
+
+  # Test 3 motors at 200Hz with custom port
+  python3 multi_motor_controller.py -r 200 -p /dev/ttyUSB1
+
+  # Test 12 motors at 80Hz with 3Mbps baudrate
+  python3 multi_motor_controller.py -n 12 -r 80 -b 3000000
+
+  # Test with custom step size (larger steps, faster cycle)
+  python3 multi_motor_controller.py -s 100
+
+  # Test with small steps for fine control
+  python3 multi_motor_controller.py -s 20 -r 50
+
+  # Test with no delay between write/read (maximum speed)
+  python3 multi_motor_controller.py -d 0
+        """
+    )
+
+    parser.add_argument(
+        "-n", "--num-motors",
+        type=int,
+        default=3,
+        help="Number of motors to control (default: 3). Motor IDs will be 1 to N."
+    )
+
+    parser.add_argument(
+        "-r", "--rate",
+        type=int,
+        default=100,
+        help="Target control frequency in Hz (default: 100)"
+    )
+
+    parser.add_argument(
+        "-p", "--port",
+        type=str,
+        default="/dev/ttyUSB0",
+        help="Serial port path (default: /dev/ttyUSB0)"
+    )
+
+    parser.add_argument(
+        "-b", "--baudrate",
+        type=int,
+        default=2000000,
+        choices=[57600, 115200, 1000000, 2000000, 3000000, 4000000],
+        help="Communication baudrate in bps (default: 2000000)"
+    )
+
+    parser.add_argument(
+        "-d", "--delay",
+        type=float,
+        default=0.0005,
+        help="Delay between write and read in seconds (default: 0.0005 = 0.5ms). Use 0 for no delay."
+    )
+
+    parser.add_argument(
+        "-s", "--step-size",
+        type=int,
+        default=40,
+        help="Position step size in Dynamixel units (default: 40). Range: 0-4095."
+    )
+
+    args = parser.parse_args()
+
+    # Validate arguments
+    if args.num_motors < 1 or args.num_motors > 253:
+        print("[ERROR] Number of motors must be between 1 and 253")
+        exit(1)
+
+    if args.rate < 1 or args.rate > 1000:
+        print("[ERROR] Control rate must be between 1 and 1000 Hz")
+        exit(1)
+
+    if args.step_size < 1 or args.step_size > 4095:
+        print("[ERROR] Step size must be between 1 and 4095")
+        exit(1)
+
+    # Run test with specified parameters
+    test_motors(
+        num_motors=args.num_motors,
+        control_rate=args.rate,
+        port=args.port,
+        baudrate=args.baudrate,
+        write_read_delay=args.delay,
+        step_size=args.step_size
+    )
