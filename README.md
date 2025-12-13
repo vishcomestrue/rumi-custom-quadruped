@@ -51,7 +51,7 @@ git clone https://github.com/ROBOTIS-GIT/DynamixelSDK.git
 
 # Navigate to the Python directory and install
 cd DynamixelSDK/python
-pip install -e .
+uv pip install -e .
 cd ../..
 ```
 
