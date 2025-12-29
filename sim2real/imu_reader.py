@@ -39,12 +39,26 @@ import sys
 import time
 import math
 from typing import Dict
+from pathlib import Path
 
 try:
     from mpu6050 import mpu6050
 except ImportError:
     print("ERROR: mpu6050-raspberrypi not installed. Install with: pip install mpu6050-raspberrypi")
     sys.exit(1)
+
+# Import Madgwick filter from sensorfusion directory
+sensorfusion_path = Path(__file__).parent / 'sensorfusion'
+if sensorfusion_path.exists():
+    sys.path.insert(0, str(sensorfusion_path))
+    try:
+        from madgwick_filter import MadgwickAHRS
+        MADGWICK_AVAILABLE = True
+    except ImportError:
+        MADGWICK_AVAILABLE = False
+        print("[WARNING] Madgwick filter not available, using complementary filter only")
+else:
+    MADGWICK_AVAILABLE = False
 
 
 # ============================================================================
@@ -54,8 +68,18 @@ except ImportError:
 class MPU6050Reader:
     """Read data from MPU6050 IMU at high frequency with velocity tracking."""
 
-    def __init__(self, address: int = 0x68, sample_rate: int = 40):
-        """Initialize MPU6050 reader."""
+    def __init__(self, address: int = 0x68, sample_rate: int = 40,
+                 orientation_filter: str = 'complementary', madgwick_beta: float = 0.1):
+        """
+        Initialize MPU6050 reader.
+
+        Args:
+            address: I2C address of MPU6050 (default 0x68)
+            sample_rate: Sampling frequency in Hz (default 40)
+            orientation_filter: 'complementary' or 'madgwick' (default 'complementary')
+            madgwick_beta: Madgwick filter gain, 0.01-0.5 (default 0.1)
+                          Only used if orientation_filter='madgwick'
+        """
         self.address = address
         self.target_sample_rate = sample_rate
         self.dt = 1.0 / sample_rate
@@ -68,6 +92,18 @@ class MPU6050Reader:
         # Calibration offsets
         self.gyro_offset = {'x': 0.0, 'y': 0.0, 'z': 0.0}
         self.accel_offset = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+
+        # Orientation filter selection
+        self.orientation_filter_type = orientation_filter
+        self.madgwick = None
+
+        if orientation_filter == 'madgwick':
+            if not MADGWICK_AVAILABLE:
+                print("[WARNING] Madgwick filter requested but not available, using complementary filter")
+                self.orientation_filter_type = 'complementary'
+            else:
+                self.madgwick = MadgwickAHRS(beta=madgwick_beta, sample_rate=sample_rate)
+                print(f"[OK] Using Madgwick AHRS filter (beta={madgwick_beta})")
 
         # Orientation state - Initialize from accelerometer to eliminate startup transient
         accel_data = self.sensor.get_accel_data()
@@ -84,7 +120,8 @@ class MPU6050Reader:
         self.stationary_threshold = 0.2  # Tighter threshold for better zero detection
         self.velocity_decay = 0.90  # More aggressive decay
 
-        print(f"[OK] MPU6050 initialized at {hex(self.address)}, {self.target_sample_rate} Hz")
+        filter_name = 'Madgwick AHRS' if self.orientation_filter_type == 'madgwick' else 'Complementary'
+        print(f"[OK] MPU6050 initialized at {hex(self.address)}, {self.target_sample_rate} Hz ({filter_name} filter)")
 
     def calibrate(self, num_samples: int = 500):
         """Calibrate gyroscope and accelerometer by measuring bias while stationary."""
@@ -178,30 +215,44 @@ class MPU6050Reader:
 
     def _update_orientation(self, ax: float, ay: float, az: float,
                           gx: float, gy: float, gz: float):
-        """Update orientation using complementary filter (98% gyro + 2% accel). Returns dt."""
+        """
+        Update orientation using selected filter (Madgwick or Complementary).
+        Returns dt (time step).
+        """
         current_time = time.time()
         dt = current_time - self.last_time
         self.last_time = current_time
 
-        # Compute roll and pitch from accelerometer (gravity vector)
-        accel_roll = math.atan2(ay, math.sqrt(ax*ax + az*az))
-        accel_pitch = math.atan2(-ax, math.sqrt(ay*ay + az*az))
+        if self.orientation_filter_type == 'madgwick' and self.madgwick is not None:
+            # Use Madgwick AHRS filter
+            self.madgwick.update(
+                gyro=[gx, gy, gz],
+                accel=[ax, ay, az],
+                dt=dt
+            )
+            self.roll, self.pitch, self.yaw = self.madgwick.get_euler()
 
-        # Integrate gyroscope
-        self.roll += gx * dt
-        self.pitch += gy * dt
-        self.yaw += gz * dt
+        else:
+            # Use complementary filter (default)
+            # Compute roll and pitch from accelerometer (gravity vector)
+            accel_roll = math.atan2(ay, math.sqrt(ax*ax + az*az))
+            accel_pitch = math.atan2(-ax, math.sqrt(ay*ay + az*az))
 
-        # Complementary filter
-        alpha = 0.98
-        self.roll = alpha * self.roll + (1 - alpha) * accel_roll
-        self.pitch = alpha * self.pitch + (1 - alpha) * accel_pitch
+            # Integrate gyroscope
+            self.roll += gx * dt
+            self.pitch += gy * dt
+            self.yaw += gz * dt
 
-        # Normalize yaw to [-pi, pi]
-        while self.yaw > math.pi:
-            self.yaw -= 2 * math.pi
-        while self.yaw < -math.pi:
-            self.yaw += 2 * math.pi
+            # Complementary filter
+            alpha = 0.98
+            self.roll = alpha * self.roll + (1 - alpha) * accel_roll
+            self.pitch = alpha * self.pitch + (1 - alpha) * accel_pitch
+
+            # Normalize yaw to [-pi, pi]
+            while self.yaw > math.pi:
+                self.yaw -= 2 * math.pi
+            while self.yaw < -math.pi:
+                self.yaw += 2 * math.pi
 
         return dt
 
@@ -345,9 +396,15 @@ def main():
     parser.add_argument('--address', type=lambda x: int(x, 0), default=0x68)
     parser.add_argument('--rate', type=int, default=40)
     parser.add_argument('--no-calibrate', action='store_true')
+    parser.add_argument('--filter', choices=['complementary', 'madgwick'],
+                        default='complementary',
+                        help='Orientation filter type')
+    parser.add_argument('--beta', type=float, default=0.1,
+                        help='Madgwick filter gain (0.01-0.5)')
     args = parser.parse_args()
 
-    imu = MPU6050Reader(address=args.address, sample_rate=args.rate)
+    imu = MPU6050Reader(address=args.address, sample_rate=args.rate,
+                        orientation_filter=args.filter, madgwick_beta=args.beta)
     if not args.no_calibrate:
         imu.calibrate()
 
