@@ -1,4 +1,5 @@
 # Rumi - Open Source Quadruped Robot
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-green.svg)](https://www.gnu.org/licenses/gpl-3.0) [![Python](https://img.shields.io/badge/Python-3.8-orange.svg)](https://docs.python.org/3/whatsnew/3.8.html) [![Project](https://img.shields.io/badge/Project-Quadruped-blue.svg)](https://github.com/lsquarelabs)
 
 ![Rumi Quadruped Robot](./assets/rumi.jpg)
 
