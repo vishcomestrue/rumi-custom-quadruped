@@ -103,6 +103,33 @@ rumi/
 3. Ensure motors are properly powered (12V for MX series)
 4. Configure motor IDs using the ROBOTIS Dynamixel Wizard if needed
 
+### USB Latency Timer Configuration (Important)
+
+For optimal high-frequency motor control, set the USB latency timer to 1ms. This is especially critical for achieving higher control rates.
+
+#### Automated Setup (One-time, Recommended)
+
+Run the automated setup script that detects your device and configures everything:
+
+```bash
+./setup_usb_latency.sh
+```
+
+The script will:
+- Detect your FTDI USB device automatically
+- Create a udev rule with the correct IDs
+- Install and activate it
+
+Done! The latency timer will be set to 1ms automatically whenever you plug in the device. This persists across reboots.
+
+#### Manual Setup (Temporary, each session)
+
+If you prefer not to install the udev rule:
+
+```bash
+sudo sh -c 'echo 1 > /sys/bus/usb-serial/devices/ttyUSB0/latency_timer'
+```
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues and pull requests.

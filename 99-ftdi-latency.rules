@@ -1,0 +1,16 @@
+# Udev rule to set USB latency timer to 1ms for FTDI FT232H adapter
+# This improves high-frequency motor control performance (80-120Hz)
+#
+# FTDI FT232H Single HS USB-UART/FIFO IC
+# Vendor ID: 0403, Product ID: 6014
+#
+# Installation:
+#   sudo cp 99-ftdi-latency.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#
+# Verify (after replugging device):
+#   cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
+#   (should show: 1)
+
+ACTION=="add", SUBSYSTEM=="usb-serial", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", ATTR{latency_timer}="1"
