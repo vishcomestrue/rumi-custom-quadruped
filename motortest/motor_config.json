@@ -1,0 +1,105 @@
+{
+  "description": "Motor configuration for 12-motor quadruped robot",
+  "control": {
+    "rate_hz": 100.0,
+    "comment": "Control loop rate in Hz"
+  },
+  "motors": {
+    "1": {
+      "name": "Front Left Hip",
+      "initial_position": 2048,
+      "kp": 800,
+      "kd": 0,
+      "min_position": 1024,
+      "max_position": 3072
+    },
+    "2": {
+      "name": "Front Left Upper",
+      "initial_position": 2048,
+      "kp": 800,
+      "kd": 0,
+      "min_position": 1024,
+      "max_position": 3072
+    },
+    "3": {
+      "name": "Front Left Knee",
+      "initial_position": 2048,
+      "kp": 800,
+      "kd": 0,
+      "min_position": 1024,
+      "max_position": 3072
+    },
+    "4": {
+      "name": "Rear Left Hip",
+      "initial_position": 2048,
+      "kp": 800,
+      "kd": 0,
+      "min_position": 1024,
+      "max_position": 3072
+    },
+    "5": {
+      "name": "Rear Left Upper",
+      "initial_position": 2048,
+      "kp": 800,
+      "kd": 0,
+      "min_position": 1024,
+      "max_position": 3072
+    },
+    "6": {
+      "name": "Rear Left Knee",
+      "initial_position": 2048,
+      "kp": 800,
+      "kd": 0,
+      "min_position": 1024,
+      "max_position": 3072
+    },
+    "7": {
+      "name": "Rear Right Hip",
+      "initial_position": 2048,
+      "kp": 800,
+      "kd": 0,
+      "min_position": 1024,
+      "max_position": 3072
+    },
+    "8": {
+      "name": "Rear Right Upper",
+      "initial_position": 2048,
+      "kp": 800,
+      "kd": 0,
+      "min_position": 1024,
+      "max_position": 3072
+    },
+    "9": {
+      "name": "Rear Right Knee",
+      "initial_position": 2048,
+      "kp": 800,
+      "kd": 0,
+      "min_position": 1024,
+      "max_position": 3072
+    },
+    "10": {
+      "name": "Front Right Hip",
+      "initial_position": 2048,
+      "kp": 800,
+      "kd": 0,
+      "min_position": 1024,
+      "max_position": 3072
+    },
+    "11": {
+      "name": "Front Right Upper",
+      "initial_position": 2048,
+      "kp": 800,
+      "kd": 0,
+      "min_position": 1024,
+      "max_position": 3072
+    },
+    "12": {
+      "name": "Front Right Knee",
+      "initial_position": 2048,
+      "kp": 800,
+      "kd": 0,
+      "min_position": 1024,
+      "max_position": 3072
+    }
+  }
+}

@@ -60,6 +60,7 @@ Usage (Multi-Motor with GroupSync - Recommended):
 
 import sys
 import os
+import json
 
 # Add the local DynamixelSDK to path
 SDK_PATH = os.path.join(os.path.dirname(__file__), '..', 'DynamixelSDK', 'python', 'src')
@@ -77,6 +78,81 @@ from dynamixel_sdk import (
     DXL_LOWORD,
     DXL_HIWORD,
 )
+
+
+def _load_motor_config(config_path=None):
+    """
+    Load motor configuration from JSON file.
+
+    Config file format:
+    {
+        "control": {"rate_hz": 100.0},
+        "motors": {
+            "1": {"initial_position": 2048, "kp": 800, "kd": 0, "min_position": 1024, "max_position": 3072},
+            ...
+        }
+    }
+
+    Args:
+        config_path: Path to JSON config file. If None, looks for 'motor_config.json'
+
+    Returns:
+        Dictionary with 'control_rate' and 'motors' (dict of motor configs)
+    """
+    # Default configuration
+    default_config = {
+        'control_rate': 100.0,
+        'motors': {}
+    }
+
+    # Initialize default motor configs (1-12)
+    for motor_id in range(1, 13):
+        default_config['motors'][motor_id] = {
+            'initial_position': 2048,
+            'kp': 800,
+            'kd': 0,
+            'min_position': 1024,
+            'max_position': 3072
+        }
+
+    # Determine config file path
+    if config_path is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(script_dir, 'motor_config.json')
+
+    # Try to load from file
+    if not os.path.exists(config_path):
+        print(f"[CONFIG] Config file not found: {config_path}")
+        print(f"[CONFIG] Using built-in defaults")
+        return default_config
+
+    try:
+        with open(config_path, 'r') as f:
+            file_config = json.load(f)
+
+        # Extract control rate
+        if 'control' in file_config:
+            default_config['control_rate'] = file_config['control'].get('rate_hz', 100.0)
+
+        # Load motor configurations
+        if 'motors' in file_config:
+            for motor_id_str, motor_data in file_config['motors'].items():
+                motor_id = int(motor_id_str)
+                # Update default with file values
+                default_config['motors'][motor_id].update(motor_data)
+
+        print(f"[CONFIG] Loaded configuration from: {config_path}")
+        print(f"[CONFIG] Control rate: {default_config['control_rate']} Hz")
+        return default_config
+
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] Failed to parse config file: {e}")
+        print(f"[CONFIG] Using built-in defaults")
+        return default_config
+    except Exception as e:
+        print(f"[ERROR] Failed to load config file: {e}")
+        print(f"[CONFIG] Using built-in defaults")
+        return default_config
 
 
 class MX64Controller:
@@ -214,7 +290,7 @@ class MX64Controller:
     # Default baud rates to try
     DEFAULT_BAUDRATES = [4000000, 2000000, 1000000, 57600, 115200]
 
-    def __init__(self, port=None, baudrate=None, motor_id=1, auto_connect=False):
+    def __init__(self, port=None, baudrate=None, motor_id=1, auto_connect=False, config_path=None):
         """
         Initialize the MX-64 controller.
 
@@ -223,6 +299,9 @@ class MX64Controller:
             baudrate: Communication baud rate. If None, will try common rates.
             motor_id: Target motor ID (default: 1)
             auto_connect: If True, connect immediately on init.
+            config_path: Path to motor configuration JSON file. If None, looks for
+                        'motor_config.json' in the same directory. Config contains
+                        initial positions, PID gains, and position limits per motor.
         """
         self.port = port
         self.baudrate = baudrate
@@ -231,6 +310,10 @@ class MX64Controller:
 
         self.port_handler = None
         self.packet_handler = None
+
+        # Load configuration from JSON file
+        self._config = _load_motor_config(config_path)
+        self.control_rate = self._config['control_rate']
 
         # Discovered motors cache
         self.discovered_motors = {}  # {id: (model_number, firmware_version)}
@@ -376,6 +459,126 @@ class MX64Controller:
                   f"(errors: {self.stats['read_errors']}), "
                   f"Writes: {self.stats['write_count']} "
                   f"(errors: {self.stats['write_errors']})")
+
+    # ==================== Configuration Methods ====================
+
+    def apply_motor_config(self, motor_id=None):
+        """
+        Apply configuration (PID gains) to a motor from loaded config.
+
+        Args:
+            motor_id: Motor ID to configure. If None, applies to all discovered motors.
+
+        Returns:
+            bool: True if successful
+        """
+        if motor_id is not None:
+            motor_ids = [motor_id]
+        else:
+            motor_ids = list(self.discovered_motors.keys())
+            if not motor_ids:
+                print("[WARNING] No motors discovered. Call scan_motors() first.")
+                return False
+
+        print(f"\n[CONFIG] Applying configuration to {len(motor_ids)} motor(s)...")
+
+        success_count = 0
+        for mid in motor_ids:
+            motor_config = self._config['motors'].get(mid, {})
+            kp = motor_config.get('kp', 800)
+            kd = motor_config.get('kd', 0)
+
+            # PID gains require torque off
+            torque_was_on = self.get_torque(mid)
+            if torque_was_on:
+                self.set_torque(False, mid)
+
+            # Write P and D gains
+            p_success = self.write_2_bytes(self.ADDR_POSITION_P_GAIN, kp, mid)
+            d_success = self.write_2_bytes(self.ADDR_POSITION_D_GAIN, kd, mid)
+
+            if p_success and d_success:
+                print(f"[OK] Motor {mid}: Kp={kp}, Kd={kd}")
+                success_count += 1
+            else:
+                print(f"[ERROR] Motor {mid}: Failed to set gains")
+
+            # Restore torque state
+            if torque_was_on:
+                self.set_torque(True, mid)
+
+        print(f"[CONFIG] Configured {success_count}/{len(motor_ids)} motors")
+        return success_count == len(motor_ids)
+
+    def validate_position(self, position, motor_id=None):
+        """
+        Validate a position against configured limits for a motor.
+
+        Args:
+            position: Position value to validate
+            motor_id: Motor ID. Uses self.motor_id if None.
+
+        Returns:
+            int: Clamped position within configured limits
+        """
+        mid = motor_id if motor_id is not None else self.motor_id
+        motor_config = self._config['motors'].get(mid, {})
+        min_pos = motor_config.get('min_position', 1024)
+        max_pos = motor_config.get('max_position', 3072)
+
+        # For extended position mode, use hardware limits instead of config limits
+        if self.is_extended_position_mode(mid):
+            min_pos = self.EXTENDED_POSITION_MIN
+            max_pos = self.EXTENDED_POSITION_MAX
+
+        return max(min_pos, min(max_pos, position))
+
+    def get_initial_positions(self):
+        """
+        Get initial positions from configuration for all motors.
+
+        Returns:
+            dict: {motor_id: initial_position}
+        """
+        return {mid: motor.get('initial_position', 2048)
+                for mid, motor in self._config['motors'].items()}
+
+    def move_to_initial_positions(self, motor_ids=None):
+        """
+        Move specified motors to their configured initial positions.
+
+        Args:
+            motor_ids: List of motor IDs. If None, moves all discovered motors.
+
+        Returns:
+            bool: True if successful
+        """
+        if motor_ids is None:
+            motor_ids = list(self.discovered_motors.keys())
+            if not motor_ids:
+                print("[WARNING] No motors discovered. Call scan_motors() first.")
+                return False
+
+        initial_positions = self.get_initial_positions()
+        target_positions = {mid: initial_positions[mid] for mid in motor_ids if mid in initial_positions}
+
+        if not target_positions:
+            print("[WARNING] No initial positions configured for specified motors")
+            return False
+
+        print(f"\n[CONFIG] Moving {len(target_positions)} motor(s) to initial positions...")
+        for mid, pos in target_positions.items():
+            print(f"  Motor {mid}: -> {pos} raw")
+
+        if self._sync_write_position is not None:
+            return self.sync_write_positions(target_positions)
+        else:
+            # Individual writes if sync not initialized
+            success = True
+            for mid, pos in target_positions.items():
+                if not self.write_position(pos, mid):
+                    success = False
+            return success
 
     # ==================== Motor Discovery ====================
 
@@ -661,11 +864,14 @@ class MX64Controller:
         """
         Write goal position in raw units.
 
-        In Position Control Mode (3): Clamps to 0-4095
-        In Extended Position Mode (4): Clamps to -1,044,479 to 1,044,479
+        In Position Control Mode (3): Clamps to configured limits (default 0-4095)
+        In Extended Position Mode (4): Clamps to hardware limits (-1,044,479 to 1,044,479)
+
+        Position is validated against configured limits from config file.
 
         Args:
             position: Target position
+            motor_id: Motor ID (uses self.motor_id if None)
 
         Returns:
             bool: Success status
@@ -673,15 +879,12 @@ class MX64Controller:
         mid = motor_id if motor_id is not None else self.motor_id
         position = int(position)
 
-        # Apply appropriate limits based on mode
-        if self.is_extended_position_mode(mid):
-            position = max(self.EXTENDED_POSITION_MIN,
-                          min(self.EXTENDED_POSITION_MAX, position))
-            # Convert negative to unsigned 32-bit for transmission
-            if position < 0:
-                position = position + 4294967296
-        else:
-            position = max(self.POSITION_MIN, min(self.POSITION_MAX, position))
+        # Validate position against configured limits
+        position = self.validate_position(position, mid)
+
+        # Convert negative to unsigned 32-bit for transmission (extended mode)
+        if self.is_extended_position_mode(mid) and position < 0:
+            position = position + 4294967296
 
         return self.write_4_bytes(self.ADDR_GOAL_POSITION, position, mid)
 
@@ -819,14 +1022,12 @@ class MX64Controller:
         for mid, position in positions_dict.items():
             position = int(position)
 
-            # Handle extended position mode (negative values)
-            if self.is_extended_position_mode(mid):
-                position = max(self.EXTENDED_POSITION_MIN,
-                              min(self.EXTENDED_POSITION_MAX, position))
-                if position < 0:
-                    position = position + 4294967296
-            else:
-                position = max(self.POSITION_MIN, min(self.POSITION_MAX, position))
+            # Validate position against configured limits
+            position = self.validate_position(position, mid)
+
+            # Convert negative to unsigned 32-bit for transmission (extended mode)
+            if self.is_extended_position_mode(mid) and position < 0:
+                position = position + 4294967296
 
             # Convert to 4-byte array (little-endian)
             param = [
