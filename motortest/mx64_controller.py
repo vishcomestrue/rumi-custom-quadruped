@@ -87,6 +87,7 @@ def _load_motor_config(config_path=None):
     Config file format:
     {
         "control": {"rate_hz": 100.0},
+        "groups": {"hip": [1,4,7,10], "thigh": [2,5,8,11], "calf": [3,6,9,12], ...},
         "motors": {
             "1": {"initial_position": 2048, "kp": 800, "kd": 0, "min_position": 1024, "max_position": 3072},
             ...
@@ -97,11 +98,22 @@ def _load_motor_config(config_path=None):
         config_path: Path to JSON config file. If None, looks for 'motor_config.json'
 
     Returns:
-        Dictionary with 'control_rate' and 'motors' (dict of motor configs)
+        Dictionary with 'control_rate', 'groups', and 'motors'
     """
     # Default configuration
     default_config = {
         'control_rate': 100.0,
+        'groups': {
+            'hip': [1, 4, 7, 10],
+            'thigh': [2, 5, 8, 11],
+            'calf': [3, 6, 9, 12],
+            'front_left_leg': [1, 2, 3],
+            'rear_left_leg': [4, 5, 6],
+            'rear_right_leg': [7, 8, 9],
+            'front_right_leg': [10, 11, 12],
+            'left_side': [1, 2, 3, 4, 5, 6],
+            'right_side': [7, 8, 9, 10, 11, 12]
+        },
         'motors': {}
     }
 
@@ -133,6 +145,10 @@ def _load_motor_config(config_path=None):
         # Extract control rate
         if 'control' in file_config:
             default_config['control_rate'] = file_config['control'].get('rate_hz', 100.0)
+
+        # Load motor groups
+        if 'groups' in file_config:
+            default_config['groups'].update(file_config['groups'])
 
         # Load motor configurations
         if 'motors' in file_config:
@@ -314,6 +330,7 @@ class MX64Controller:
         # Load configuration from JSON file
         self._config = _load_motor_config(config_path)
         self.control_rate = self._config['control_rate']
+        self.groups = self._config['groups']
 
         # Discovered motors cache
         self.discovered_motors = {}  # {id: (model_number, firmware_version)}
@@ -326,6 +343,9 @@ class MX64Controller:
         self._sync_read_position = None
         self._sync_write_position = None
         self._sync_motor_ids = []  # Motors registered for sync operations
+
+        # Initial positions read during initialize()
+        self.initial_positions = {}
 
         # Statistics
         self.stats = {
@@ -462,27 +482,155 @@ class MX64Controller:
 
     # ==================== Configuration Methods ====================
 
-    def apply_motor_config(self, motor_id=None):
+    def initialize(self, expected_motors=12):
         """
-        Apply configuration (PID gains) to a motor from loaded config.
+        Full initialization sequence for robot startup.
+
+        Steps:
+            1. Connect to motors (auto-scan ports/baudrates)
+            2. Discover all motors
+            3. Verify expected motor count
+            4. Apply PID gains from config file
+            5. Initialize GroupSync for efficient communication
+            6. Read initial positions
+            7. Enable torque on all motors
+
+        After this method returns successfully:
+            - All motors are connected and verified
+            - PID gains are set from config
+            - GroupSync is ready for fast read/write
+            - Initial positions are stored in self.initial_positions
+            - Torque is ON - motors are holding position
 
         Args:
-            motor_id: Motor ID to configure. If None, applies to all discovered motors.
+            expected_motors: Expected number of motors (default: 12)
 
         Returns:
-            bool: True if successful
+            list: List of discovered motor IDs if successful, None if failed
         """
-        if motor_id is not None:
-            motor_ids = [motor_id]
-        else:
+        print("\n" + "=" * 60)
+        print("   Motor Initialization")
+        print("=" * 60)
+
+        # Step 1: Connect
+        print("\n[STEP 1] Connecting to motors...")
+        print("-" * 40)
+
+        if not self.connect():
+            print("\n[FAILED] Could not connect to any motors.")
+            print("Please check:")
+            print("  - Motors are powered (12V)")
+            print("  - USB cable is connected")
+            print("  - Correct permissions on /dev/ttyUSB*")
+            return None
+
+        # Step 2: Discover motors
+        print("\n[STEP 2] Discovering motors...")
+        print("-" * 40)
+
+        motors = self.scan_motors(verbose=True)
+
+        if not motors:
+            print("[FAILED] No motors discovered.")
+            self.disconnect()
+            return None
+
+        motor_ids = sorted(motors.keys())
+        print(f"\nFound {len(motor_ids)} motor(s): {motor_ids}")
+
+        # Step 3: Verify motor count
+        print("\n[STEP 3] Verifying motor count...")
+        print("-" * 40)
+
+        if len(motor_ids) != expected_motors:
+            print(f"[WARNING] Expected {expected_motors} motors, found {len(motor_ids)}")
+            print(f"  Missing motors: {[m for m in range(1, expected_motors + 1) if m not in motor_ids]}")
+            self.disconnect()
+            return None
+
+        print(f"[OK] All {expected_motors} motors found")
+
+        # Step 4: Apply PID configuration
+        print("\n[STEP 4] Applying PID gains from config...")
+        print("-" * 40)
+
+        if not self.apply_pid_config(motor_ids):
+            print("[FAILED] Could not apply PID configuration")
+            self.disconnect()
+            return None
+
+        # Step 5: Initialize GroupSync
+        print("\n[STEP 5] Initializing GroupSync...")
+        print("-" * 40)
+
+        if not self.init_sync(motor_ids):
+            print("[FAILED] Could not initialize GroupSync")
+            self.disconnect()
+            return None
+
+        print("[OK] GroupSync ready - all motors read/write in ONE packet")
+
+        # Step 6: Read initial positions
+        print("\n[STEP 6] Reading initial positions...")
+        print("-" * 40)
+
+        positions = self.sync_read_positions(max_retries=10, retry_delay=0.02)
+        if positions is None:
+            print("[WARNING] Sync read failed, trying individual reads...")
+            positions = {}
+            for mid in motor_ids:
+                pos = self.read_position(mid)
+                if pos is not None:
+                    positions[mid] = pos
+                else:
+                    print(f"[FAILED] Could not read position for motor {mid}")
+                    self.disconnect()
+                    return None
+
+        self.initial_positions = positions.copy()
+        for mid in motor_ids:
+            print(f"  Motor {mid:2d}: {self.initial_positions[mid]:5d} raw")
+
+        # Step 7: Enable torque on all motors
+        print("\n[STEP 7] Enabling torque on all motors...")
+        print("-" * 40)
+
+        for mid in motor_ids:
+            if self.set_torque(True, mid):
+                print(f"  Motor {mid:2d}: Torque ON [OK]")
+            else:
+                print(f"  Motor {mid:2d}: Torque ON [FAILED]")
+                self.disconnect()
+                return None
+
+        print("\n" + "=" * 60)
+        print(f"[SUCCESS] Initialization complete - {len(motor_ids)} motors ready")
+        print("=" * 60)
+
+        return motor_ids
+
+    def apply_pid_config(self, motor_ids=None):
+        """
+        Apply PID gains (Kp, Kd) from config file to specified motors.
+
+        Note: PID writes require torque to be OFF. This method will temporarily
+        disable torque if needed and restore it afterwards.
+
+        Args:
+            motor_ids: List of motor IDs to configure. If None, uses discovered motors.
+
+        Returns:
+            bool: True if all motors configured successfully
+        """
+        if motor_ids is None:
             motor_ids = list(self.discovered_motors.keys())
             if not motor_ids:
                 print("[WARNING] No motors discovered. Call scan_motors() first.")
                 return False
 
-        print(f"\n[CONFIG] Applying configuration to {len(motor_ids)} motor(s)...")
-
         success_count = 0
+        fail_count = 0
+
         for mid in motor_ids:
             motor_config = self._config['motors'].get(mid, {})
             kp = motor_config.get('kp', 800)
@@ -498,17 +646,23 @@ class MX64Controller:
             d_success = self.write_2_bytes(self.ADDR_POSITION_D_GAIN, kd, mid)
 
             if p_success and d_success:
-                print(f"[OK] Motor {mid}: Kp={kp}, Kd={kd}")
+                print(f"  Motor {mid:2d}: Kp={kp:4d}, Kd={kd:4d} [OK]")
                 success_count += 1
             else:
-                print(f"[ERROR] Motor {mid}: Failed to set gains")
+                print(f"  Motor {mid:2d}: Kp={kp:4d}, Kd={kd:4d} [FAILED]")
+                fail_count += 1
 
             # Restore torque state
             if torque_was_on:
                 self.set_torque(True, mid)
 
-        print(f"[CONFIG] Configured {success_count}/{len(motor_ids)} motors")
-        return success_count == len(motor_ids)
+        print(f"\n[CONFIG] Applied PID to {success_count}/{len(motor_ids)} motors", end="")
+        if fail_count > 0:
+            print(f" ({fail_count} failed)")
+        else:
+            print()
+
+        return fail_count == 0
 
     def validate_position(self, position, motor_id=None):
         """

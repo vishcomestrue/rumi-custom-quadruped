@@ -1,8 +1,18 @@
 {
   "description": "Motor configuration for 12-motor quadruped robot",
   "control": {
-    "rate_hz": 100.0,
-    "comment": "Control loop rate in Hz"
+    "rate_hz": 100.0
+  },
+  "groups": {
+    "hip": [1, 4, 7, 10],
+    "thigh": [2, 5, 8, 11],
+    "calf": [3, 6, 9, 12],
+    "front_left_leg": [1, 2, 3],
+    "rear_left_leg": [4, 5, 6],
+    "rear_right_leg": [7, 8, 9],
+    "front_right_leg": [10, 11, 12],
+    "left_side": [1, 2, 3, 4, 5, 6],
+    "right_side": [7, 8, 9, 10, 11, 12]
   },
   "motors": {
     "1": {
@@ -14,7 +24,7 @@
       "max_position": 3072
     },
     "2": {
-      "name": "Front Left Upper",
+      "name": "Front Left Thigh",
       "initial_position": 2048,
       "kp": 800,
       "kd": 0,
@@ -22,7 +32,7 @@
       "max_position": 3072
     },
     "3": {
-      "name": "Front Left Knee",
+      "name": "Front Left Calf",
       "initial_position": 2048,
       "kp": 800,
       "kd": 0,
@@ -38,7 +48,7 @@
       "max_position": 3072
     },
     "5": {
-      "name": "Rear Left Upper",
+      "name": "Rear Left Thigh",
       "initial_position": 2048,
       "kp": 800,
       "kd": 0,
@@ -46,7 +56,7 @@
       "max_position": 3072
     },
     "6": {
-      "name": "Rear Left Knee",
+      "name": "Rear Left Calf",
       "initial_position": 2048,
       "kp": 800,
       "kd": 0,
@@ -62,7 +72,7 @@
       "max_position": 3072
     },
     "8": {
-      "name": "Rear Right Upper",
+      "name": "Rear Right Thigh",
       "initial_position": 2048,
       "kp": 800,
       "kd": 0,
@@ -70,7 +80,7 @@
       "max_position": 3072
     },
     "9": {
-      "name": "Rear Right Knee",
+      "name": "Rear Right Calf",
       "initial_position": 2048,
       "kp": 800,
       "kd": 0,
@@ -86,7 +96,7 @@
       "max_position": 3072
     },
     "11": {
-      "name": "Front Right Upper",
+      "name": "Front Right Thigh",
       "initial_position": 2048,
       "kp": 800,
       "kd": 0,
@@ -94,7 +104,7 @@
       "max_position": 3072
     },
     "12": {
-      "name": "Front Right Knee",
+      "name": "Front Right Calf",
       "initial_position": 2048,
       "kp": 800,
       "kd": 0,
