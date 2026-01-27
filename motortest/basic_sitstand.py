@@ -34,14 +34,15 @@ import argparse
 from mx64_controller import MX64Controller
 
 
-def run_sitstand(control_freq=5.0, step_size=30, target_offset=500, repeat=1):
+def run_sitstand(control_freq=5.0, step_size=30, target_knee=500, target_hip=-200, repeat=1):
     """
     Run basic sit-stand motion.
 
     Args:
         control_freq: Control loop frequency in Hz (default: 5 Hz)
         step_size: Position step size in raw units (default: 30)
-        target_offset: Target offset for sit position (default: 500)
+        target_knee: Target offset for knee motors 3,6,9,12 (default: 500)
+        target_hip: Target offset for hip motors - goes to 2,5; negative goes to 8,11 (default: -200)
         repeat: Number of times to repeat the sit-stand cycle (default: 1)
     """
     print("\n" + "=" * 60)
@@ -50,7 +51,8 @@ def run_sitstand(control_freq=5.0, step_size=30, target_offset=500, repeat=1):
     print(f"\nParameters:")
     print(f"  Control frequency: {control_freq} Hz ({1000/control_freq:.1f} ms period)")
     print(f"  Step size: {step_size} raw units")
-    print(f"  Target: Motors 9,12 -> +{target_offset}r | Motors 3,6 -> -{target_offset}r")
+    print(f"  Target Knee: Motors 9,12 -> +{target_knee}r | Motors 3,6 -> -{target_knee}r")
+    print(f"  Target Hip:  Motors 2,5 -> {target_hip:+d}r | Motors 8,11 -> {-target_hip:+d}r")
     print(f"  Repeat: {repeat} cycle(s)")
     print("=" * 60)
 
@@ -101,13 +103,18 @@ def run_sitstand(control_freq=5.0, step_size=30, target_offset=500, repeat=1):
         return
 
     # Split into groups for opposite motion
-    group_a = [mid for mid in target_motor_ids if mid in [3, 6]]   # Go negative
-    group_b = [mid for mid in target_motor_ids if mid in [9, 12]]  # Go positive
+    group_a = [mid for mid in target_motor_ids if mid in [3, 6]]   # Go negative (offset 1)
+    group_b = [mid for mid in target_motor_ids if mid in [9, 12]]  # Go positive (offset 1)
+    group_c = [mid for mid in all_motor_ids if mid in [2, 5]]  # Go negative (offset 2)
+    group_d = [mid for mid in all_motor_ids if mid in [8, 11]]  # Go positive (offset 2)
 
-    print(f"\n[INFO] Target motors: {target_motor_ids}")
-    print(f"[INFO]   Group A (3, 6) -> -{target_offset}r: {group_a}")
-    print(f"[INFO]   Group B (9, 12) -> +{target_offset}r: {group_b}")
-    print(f"[INFO] Other motors hold position: {[m for m in all_motor_ids if m not in target_motor_ids]}")
+    print(f"\n[INFO] Target knee motors: {target_motor_ids}")
+    print(f"[INFO]   Group A (3, 6) -> -{target_knee}r: {group_a}")
+    print(f"[INFO]   Group B (9, 12) -> +{target_knee}r: {group_b}")
+    print(f"[INFO] Target hip motors:")
+    print(f"[INFO]   Group C (2, 5) -> {target_hip:+d}r: {group_c}")
+    print(f"[INFO]   Group D (8, 11) -> {-target_hip:+d}r: {group_d}")
+    print(f"[INFO] Other motors hold position: {[m for m in all_motor_ids if m not in target_motor_ids and m not in group_c and m not in group_d]}")
 
     # Step 3: Initialize GroupSync
     print("\n[STEP 3] Initializing GroupSync...")
@@ -145,9 +152,13 @@ def run_sitstand(control_freq=5.0, step_size=30, target_offset=500, repeat=1):
         ref_pos = reference_positions[mid]
         marker = ""
         if mid in group_a:
-            marker = f" -> will go to {ref_pos - target_offset}r (-{target_offset}r)"
+            marker = f" -> will go to {ref_pos - target_knee}r (-{target_knee}r)"
         elif mid in group_b:
-            marker = f" -> will go to {ref_pos + target_offset}r (+{target_offset}r)"
+            marker = f" -> will go to {ref_pos + target_knee}r (+{target_knee}r)"
+        elif mid in group_c:
+            marker = f" -> will go to {ref_pos + target_hip}r ({target_hip:+d}r)"
+        elif mid in group_d:
+            marker = f" -> will go to {ref_pos - target_hip}r ({-target_hip:+d}r)"
         print(f"  Motor {mid}: {ref_pos} raw{marker}")
 
     # Step 5: Enable torque on all motors
@@ -173,7 +184,12 @@ def run_sitstand(control_freq=5.0, step_size=30, target_offset=500, repeat=1):
     print("-" * 40)
 
     target_period = 1.0 / control_freq
-    current_offset = 0  # Start at reference (standing)
+    current_knee = 0  # Start at reference (standing)
+    current_hip = 0  # Start at reference for hip motors
+
+    # Determine step directions
+    knee_step = step_size
+    hip_step = step_size if target_hip > 0 else -step_size
 
     try:
         for cycle in range(1, repeat + 1):
@@ -182,23 +198,45 @@ def run_sitstand(control_freq=5.0, step_size=30, target_offset=500, repeat=1):
                 print(f"  CYCLE {cycle} of {repeat}")
                 print(f"{'=' * 40}")
 
-            # Phase 1: STAND -> SIT (go to +target_offset for group B)
+            # Phase 1: STAND -> SIT (go to target offsets)
             print("\n[PHASE 1] Moving to SIT position...")
-            print(f"  Motors 9, 12: 0r -> +{target_offset}r")
-            print(f"  Motors 3, 6:  0r -> -{target_offset}r")
+            print(f"  Motors 9, 12 (knee): 0r -> +{target_knee}r")
+            print(f"  Motors 3, 6  (knee): 0r -> -{target_knee}r")
+            print(f"  Motors 2, 5  (hip):  0r -> {target_hip:+d}r")
+            print(f"  Motors 8, 11 (hip):  0r -> {-target_hip:+d}r")
 
-            while current_offset < target_offset:
+            # Continue until both reach their targets
+            while (current_knee < target_knee if target_knee > 0 else current_knee > target_knee) or \
+                  (current_hip < target_hip if target_hip > 0 else current_hip > target_hip):
                 loop_start = time.time()
 
-                current_offset = min(current_offset + step_size, target_offset)
+                # Move knee toward target
+                if target_knee > 0:
+                    if current_knee < target_knee:
+                        current_knee = min(current_knee + knee_step, target_knee)
+                else:
+                    if current_knee > target_knee:
+                        current_knee = max(current_knee - knee_step, target_knee)
+
+                # Move hip toward target
+                if target_hip > 0:
+                    if current_hip < target_hip:
+                        current_hip = min(current_hip + abs(hip_step), target_hip)
+                else:
+                    if current_hip > target_hip:
+                        current_hip = max(current_hip - abs(hip_step), target_hip)
 
                 # Build target positions
                 target_positions = {}
                 for mid in all_motor_ids:
                     if mid in group_a:
-                        target_positions[mid] = reference_positions[mid] - current_offset
+                        target_positions[mid] = reference_positions[mid] - current_knee
                     elif mid in group_b:
-                        target_positions[mid] = reference_positions[mid] + current_offset
+                        target_positions[mid] = reference_positions[mid] + current_knee
+                    elif mid in group_c:
+                        target_positions[mid] = reference_positions[mid] + current_hip
+                    elif mid in group_d:
+                        target_positions[mid] = reference_positions[mid] - current_hip
                     else:
                         target_positions[mid] = reference_positions[mid]
 
@@ -207,7 +245,7 @@ def run_sitstand(control_freq=5.0, step_size=30, target_offset=500, repeat=1):
                     break
 
                 # Status update
-                print(f"\r  Offset: {current_offset:4d}r / {target_offset}r", end="", flush=True)
+                print(f"\r  Knee: {current_knee:5.0f}r / {target_knee}r | Hip: {current_hip:5.0f}r / {target_hip}r", end="", flush=True)
 
                 # Maintain frequency
                 elapsed = time.time() - loop_start
@@ -215,7 +253,7 @@ def run_sitstand(control_freq=5.0, step_size=30, target_offset=500, repeat=1):
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
-            print(f"\r  Offset: {current_offset:4d}r / {target_offset}r - DONE")
+            print(f"\r  Knee: {current_knee:5.0f}r / {target_knee}r | Hip: {current_hip:5.0f}r / {target_hip}r - DONE")
 
             # Hold at sit position briefly
             print("\n[HOLD] At SIT position for 1 second...")
@@ -223,21 +261,38 @@ def run_sitstand(control_freq=5.0, step_size=30, target_offset=500, repeat=1):
 
             # Phase 2: SIT -> STAND (return to reference)
             print("\n[PHASE 2] Moving to STAND position...")
-            print(f"  Motors 9, 12: +{target_offset}r -> 0r")
-            print(f"  Motors 3, 6:  -{target_offset}r -> 0r")
+            print(f"  Motors 9, 12 (knee): {target_knee:+d}r -> 0r")
+            print(f"  Motors 3, 6  (knee): {-target_knee:+d}r -> 0r")
+            print(f"  Motors 2, 5  (hip):  {target_hip:+d}r -> 0r")
+            print(f"  Motors 8, 11 (hip):  {-target_hip:+d}r -> 0r")
 
-            while current_offset > 0:
+            # Return to zero
+            while current_knee != 0 or current_hip != 0:
                 loop_start = time.time()
 
-                current_offset = max(current_offset - step_size, 0)
+                # Move knee back to zero
+                if current_knee > 0:
+                    current_knee = max(current_knee - knee_step, 0)
+                elif current_knee < 0:
+                    current_knee = min(current_knee + knee_step, 0)
+
+                # Move hip back to zero
+                if current_hip > 0:
+                    current_hip = max(current_hip - abs(hip_step), 0)
+                elif current_hip < 0:
+                    current_hip = min(current_hip + abs(hip_step), 0)
 
                 # Build target positions
                 target_positions = {}
                 for mid in all_motor_ids:
                     if mid in group_a:
-                        target_positions[mid] = reference_positions[mid] - current_offset
+                        target_positions[mid] = reference_positions[mid] - current_knee
                     elif mid in group_b:
-                        target_positions[mid] = reference_positions[mid] + current_offset
+                        target_positions[mid] = reference_positions[mid] + current_knee
+                    elif mid in group_c:
+                        target_positions[mid] = reference_positions[mid] + current_hip
+                    elif mid in group_d:
+                        target_positions[mid] = reference_positions[mid] - current_hip
                     else:
                         target_positions[mid] = reference_positions[mid]
 
@@ -246,7 +301,7 @@ def run_sitstand(control_freq=5.0, step_size=30, target_offset=500, repeat=1):
                     break
 
                 # Status update
-                print(f"\r  Offset: {current_offset:4d}r / 0r", end="", flush=True)
+                print(f"\r  Knee: {current_knee:5.0f}r / 0r | Hip: {current_hip:5.0f}r / 0r", end="", flush=True)
 
                 # Maintain frequency
                 elapsed = time.time() - loop_start
@@ -254,7 +309,7 @@ def run_sitstand(control_freq=5.0, step_size=30, target_offset=500, repeat=1):
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
-            print(f"\r  Offset: {current_offset:4d}r / 0r - DONE")
+            print(f"\r  Knee: {current_knee:5.0f}r / 0r | Hip: {current_hip:5.0f}r / 0r - DONE")
 
             # Hold at stand position briefly between cycles (except last)
             if cycle < repeat:
@@ -285,7 +340,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Default: 5 Hz, step 30, target 500r, 1 cycle
+  # Default: 5 Hz, step 30, knee 500r, hip -200r, 1 cycle
   uv run python basic_sitstand.py
 
   # Faster movement (10 Hz)
@@ -294,14 +349,14 @@ Examples:
   # Smaller steps for smoother motion
   uv run python basic_sitstand.py -s 15
 
-  # Different target offset
-  uv run python basic_sitstand.py -t 400
+  # Different target offsets
+  uv run python basic_sitstand.py -tk 400 -th -150
 
   # Repeat 5 times
   uv run python basic_sitstand.py -r 5
 
 Motion:
-  STAND (reference) -> SIT (+500r for 9,12 / -500r for 3,6) -> STAND (repeat x times)
+  STAND (reference) -> SIT (knee: +500r for 9,12 / -500r for 3,6 | hip: -200r for 2,5 / +200r for 8,11) -> STAND (repeat x times)
         """
     )
 
@@ -320,10 +375,19 @@ Motion:
     )
 
     parser.add_argument(
-        "-t", "--target",
+        "-tk", "--target-knee",
         type=int,
         default=500,
-        help="Target offset for sit position in raw units (default: 500)"
+        dest="target_knee",
+        help="Target offset for knee motors 3,6,9,12 in raw units (default: 500)"
+    )
+
+    parser.add_argument(
+        "-th", "--target-hip",
+        type=int,
+        default=-200,
+        dest="target_hip",
+        help="Target offset for hip motors - goes to 2,5; negative goes to 8,11 in raw units (default: -200)"
     )
 
     parser.add_argument(
@@ -344,8 +408,12 @@ Motion:
         print("[ERROR] Step size must be positive")
         sys.exit(1)
 
-    if args.target <= 0:
-        print("[ERROR] Target offset must be positive")
+    if args.target_knee <= 0:
+        print("[ERROR] Target knee offset must be positive")
+        sys.exit(1)
+
+    if args.target_hip == 0:
+        print("[ERROR] Target hip offset must be non-zero")
         sys.exit(1)
 
     if args.repeat <= 0:
@@ -355,7 +423,8 @@ Motion:
     run_sitstand(
         control_freq=args.freq,
         step_size=args.step,
-        target_offset=args.target,
+        target_knee=args.target_knee,
+        target_hip=args.target_hip,
         repeat=args.repeat
     )
 
