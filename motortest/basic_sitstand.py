@@ -34,23 +34,30 @@ import argparse
 from mx64_controller import MX64Controller
 
 
-def run_sitstand(control_freq=5.0, step_size=30, target_knee=500, target_hip=-200, repeat=1):
+def run_sitstand(control_freq=5.0, duration=2.0, target_knee=500, target_hip=-200, repeat=1):
     """
     Run basic sit-stand motion.
 
     Args:
         control_freq: Control loop frequency in Hz (default: 5 Hz)
-        step_size: Position step size in raw units (default: 30)
+        duration: Time in seconds to reach full sit position (default: 2.0)
         target_knee: Target offset for knee motors 3,6,9,12 (default: 500)
         target_hip: Target offset for hip motors - goes to 2,5; negative goes to 8,11 (default: -200)
         repeat: Number of times to repeat the sit-stand cycle (default: 1)
     """
+    # Calculate step sizes based on duration and frequency
+    num_steps = duration * control_freq
+    sk = abs(target_knee) / num_steps  # Step size for knee
+    sh = abs(target_hip) / num_steps   # Step size for hip
+
     print("\n" + "=" * 60)
     print("   Basic Sit-Stand Motion Test")
     print("=" * 60)
     print(f"\nParameters:")
     print(f"  Control frequency: {control_freq} Hz ({1000/control_freq:.1f} ms period)")
-    print(f"  Step size: {step_size} raw units")
+    print(f"  Duration: {duration:.2f} seconds ({num_steps:.0f} steps)")
+    print(f"  Step size knee (sk): {sk:.2f} raw units/step")
+    print(f"  Step size hip (sh): {sh:.2f} raw units/step")
     print(f"  Target Knee: Motors 9,12 -> +{target_knee}r | Motors 3,6 -> -{target_knee}r")
     print(f"  Target Hip:  Motors 2,5 -> {target_hip:+d}r | Motors 8,11 -> {-target_hip:+d}r")
     print(f"  Repeat: {repeat} cycle(s)")
@@ -178,7 +185,7 @@ def run_sitstand(control_freq=5.0, step_size=30, target_knee=500, target_hip=-20
     print("-" * 40)
     print("Sequence: STAND -> SIT -> STAND")
     print(f"Frequency: {control_freq} Hz")
-    print(f"Step size: {step_size} raw units per cycle")
+    print(f"Step sizes: sk={sk:.2f}, sh={sh:.2f} raw units per cycle")
     print(f"Repeats: {repeat}")
     print("\nPress Ctrl+C to stop at any time")
     print("-" * 40)
@@ -187,9 +194,9 @@ def run_sitstand(control_freq=5.0, step_size=30, target_knee=500, target_hip=-20
     current_knee = 0  # Start at reference (standing)
     current_hip = 0  # Start at reference for hip motors
 
-    # Determine step directions
-    knee_step = step_size
-    hip_step = step_size if target_hip > 0 else -step_size
+    # Determine step directions and sizes
+    knee_step = sk
+    hip_step = sh
 
     try:
         for cycle in range(1, repeat + 1):
@@ -340,23 +347,27 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Default: 5 Hz, step 30, knee 500r, hip -200r, 1 cycle
+  # Default: 5 Hz, 2.0s duration, knee 500r, hip -200r, 1 cycle
   uv run python basic_sitstand.py
 
-  # Faster movement (10 Hz)
+  # Faster control loop (10 Hz)
   uv run python basic_sitstand.py -f 10
 
-  # Smaller steps for smoother motion
-  uv run python basic_sitstand.py -s 15
+  # Slower transition (5 seconds)
+  uv run python basic_sitstand.py -d 5.0
 
   # Different target offsets
   uv run python basic_sitstand.py -tk 400 -th -150
 
-  # Repeat 5 times
-  uv run python basic_sitstand.py -r 5
+  # Repeat 5 times with 3 second duration
+  uv run python basic_sitstand.py -r 5 -d 3.0
 
 Motion:
   STAND (reference) -> SIT (knee: +500r for 9,12 / -500r for 3,6 | hip: -200r for 2,5 / +200r for 8,11) -> STAND (repeat x times)
+
+Step sizes (sk, sh) are automatically calculated as:
+  sk = |target_knee| / (duration * frequency)
+  sh = |target_hip| / (duration * frequency)
         """
     )
 
@@ -368,10 +379,10 @@ Motion:
     )
 
     parser.add_argument(
-        "-s", "--step",
-        type=int,
-        default=30,
-        help="Step size in raw units (default: 30)"
+        "-d", "--duration",
+        type=float,
+        default=2.0,
+        help="Duration in seconds to reach full sit position (default: 2.0)"
     )
 
     parser.add_argument(
@@ -404,8 +415,8 @@ Motion:
         print("[ERROR] Frequency must be between 0 and 100 Hz")
         sys.exit(1)
 
-    if args.step <= 0:
-        print("[ERROR] Step size must be positive")
+    if args.duration <= 0:
+        print("[ERROR] Duration must be positive")
         sys.exit(1)
 
     if args.target_knee <= 0:
@@ -422,7 +433,7 @@ Motion:
 
     run_sitstand(
         control_freq=args.freq,
-        step_size=args.step,
+        duration=args.duration,
         target_knee=args.target_knee,
         target_hip=args.target_hip,
         repeat=args.repeat
