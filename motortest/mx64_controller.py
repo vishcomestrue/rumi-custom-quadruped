@@ -61,6 +61,12 @@ Usage (Multi-Motor with GroupSync - Recommended):
 import sys
 import os
 import json
+import time
+import math
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import Optional, Dict, List, NamedTuple
+from contextlib import contextmanager
 
 # Add the local DynamixelSDK to path
 SDK_PATH = os.path.join(os.path.dirname(__file__), '..', 'DynamixelSDK', 'python', 'src')
@@ -80,23 +86,250 @@ from dynamixel_sdk import (
 )
 
 
-def _load_motor_config(config_path=None):
+class OperatingMode(IntEnum):
+    """MX-64 operating modes with type safety."""
+    CURRENT = 0
+    VELOCITY = 1
+    POSITION = 3
+    EXTENDED_POSITION = 4
+    CURRENT_BASED_POSITION = 5
+    PWM = 16
+
+
+class MotorInfo(NamedTuple):
+    """Complete motor status information with type safety."""
+    model: int
+    firmware: int
+    operating_mode: int
+    temperature: int
+    voltage: float
+    position: int
+    velocity: int
+    current: int
+    is_moving: bool
+    hardware_error: int
+
+
+@dataclass
+class MotorConfig:
+    """
+    Motor configuration with type safety and automatic PID conversion.
+
+    Attributes:
+        initial_position: Default motor position (0-4095 for MX-64)
+        kp: Actual Kp value (converted to raw: Kp × 128)
+        kd: Actual Kd value (converted to raw: Kd × 16)
+        min_position: Minimum allowed position
+        max_position: Maximum allowed position
+        kp_raw: Cached raw Kp value for register writes
+        kd_raw: Cached raw Kd value for register writes
+    """
+    initial_position: int = 2048
+    kp: float = 6.25
+    kd: float = 0.0
+    min_position: int = 1024
+    max_position: int = 3072
+    kp_raw: int = 800  # Cached raw value: 6.25 × 128 = 800
+    kd_raw: int = 0    # Cached raw value: 0.0 × 16 = 0
+
+    def update_from_dict(self, data: dict):
+        """Update motor config from dictionary and recompute raw values."""
+        if 'initial_position' in data:
+            pos = data['initial_position']
+            if not (0 <= pos <= 4095):
+                print(f"[WARNING] Invalid initial_position {pos} (must be 0-4095), clamping")
+                pos = max(0, min(4095, pos))
+            self.initial_position = pos
+
+        if 'kp' in data:
+            kp = data['kp']
+            # Kp valid range: 0 to 127.99 (max raw 16383 / 128)
+            if not (0 <= kp <= 127.99):
+                print(f"[WARNING] Invalid Kp {kp} (must be 0-127.99), clamping")
+                kp = max(0.0, min(127.99, kp))
+            self.kp = kp
+            self.kp_raw = int(round(self.kp * 128))
+
+        if 'kd' in data:
+            kd = data['kd']
+            # Kd valid range: 0 to 1023.94 (max raw 16383 / 16)
+            if not (0 <= kd <= 1023.94):
+                print(f"[WARNING] Invalid Kd {kd} (must be 0-1023.94), clamping")
+                kd = max(0.0, min(1023.94, kd))
+            self.kd = kd
+            self.kd_raw = int(round(self.kd * 16))
+
+        if 'min_position' in data:
+            min_pos = data['min_position']
+            if not (0 <= min_pos <= 4095):
+                print(f"[WARNING] Invalid min_position {min_pos} (must be 0-4095), clamping")
+                min_pos = max(0, min(4095, min_pos))
+            self.min_position = min_pos
+
+        if 'max_position' in data:
+            max_pos = data['max_position']
+            if not (0 <= max_pos <= 4095):
+                print(f"[WARNING] Invalid max_position {max_pos} (must be 0-4095), clamping")
+                max_pos = max(0, min(4095, max_pos))
+            self.max_position = max_pos
+
+        # Clamp raw values to valid range (0-16383)
+        self.kp_raw = max(0, min(16383, self.kp_raw))
+        self.kd_raw = max(0, min(16383, self.kd_raw))
+
+
+class MotorConfigManager:
+    """
+    Manages motor configuration loading and validation.
+
+    Separates configuration concerns from motor control logic.
+    Provides a clean interface for accessing motor configurations,
+    control rates, and motor groupings.
+    """
+
+    def __init__(self, config_path: Optional[str] = None):
+        """
+        Initialize configuration manager.
+
+        Args:
+            config_path: Path to JSON config file. If None, looks for 'motor_config.json'
+        """
+        self.config_path = self._resolve_path(config_path)
+        self._config = self._load()
+
+    def _resolve_path(self, path: Optional[str]) -> str:
+        """
+        Resolve configuration file path.
+
+        Args:
+            path: User-provided path or None
+
+        Returns:
+            Absolute path to config file
+        """
+        if path is None:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            return os.path.join(script_dir, 'motor_config.json')
+        return path
+
+    def _create_defaults(self) -> Dict:
+        """
+        Create default configuration.
+
+        Returns:
+            Dictionary with default control rate, groups, and motor configs
+        """
+        default_config = {
+            'control_rate': 100.0,
+            'groups': {
+                'hip': [1, 4, 7, 10],
+                'thigh': [2, 5, 8, 11],
+                'calf': [3, 6, 9, 12],
+                'front_left_leg': [1, 2, 3],
+                'rear_left_leg': [4, 5, 6],
+                'rear_right_leg': [7, 8, 9],
+                'front_right_leg': [10, 11, 12],
+                'left_side': [1, 2, 3, 4, 5, 6],
+                'right_side': [7, 8, 9, 10, 11, 12]
+            },
+            'motors': {}
+        }
+
+        # Initialize default motor configs (1-12)
+        for motor_id in range(1, 13):
+            default_config['motors'][motor_id] = MotorConfig()
+
+        return default_config
+
+    def _load(self) -> Dict:
+        """
+        Load and validate configuration from file.
+
+        Returns:
+            Configuration dictionary
+        """
+        default_config = self._create_defaults()
+
+        # Try to load from file
+        if not os.path.exists(self.config_path):
+            print(f"[CONFIG] Config file not found: {self.config_path}")
+            print(f"[CONFIG] Using built-in defaults")
+            return default_config
+
+        try:
+            with open(self.config_path, 'r') as f:
+                file_config = json.load(f)
+
+            # Extract and validate control rate
+            if 'control' in file_config:
+                rate_hz = file_config['control'].get('rate_hz', 100.0)
+
+                # Validate control rate (0.1 Hz to 1000 Hz is reasonable range)
+                if not (0.1 <= rate_hz <= 1000.0):
+                    print(f"[WARNING] Invalid control rate {rate_hz} Hz (must be 0.1-1000 Hz)")
+                    print(f"[WARNING] Using default: 100.0 Hz")
+                    rate_hz = 100.0
+
+                default_config['control_rate'] = rate_hz
+
+            # Load motor groups
+            if 'groups' in file_config:
+                default_config['groups'].update(file_config['groups'])
+
+            # Load motor configurations
+            if 'motors' in file_config:
+                for motor_id_str, motor_data in file_config['motors'].items():
+                    motor_id = int(motor_id_str)
+                    # Update default with file values and cache raw PID values
+                    default_config['motors'][motor_id].update_from_dict(motor_data)
+
+            print(f"[CONFIG] Loaded configuration from: {self.config_path}")
+            print(f"[CONFIG] Control rate: {default_config['control_rate']} Hz")
+            return default_config
+
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Failed to parse config file: {e}")
+            print(f"[CONFIG] Using built-in defaults")
+            return default_config
+        except Exception as e:
+            print(f"[ERROR] Failed to load config file: {e}")
+            print(f"[CONFIG] Using built-in defaults")
+            return default_config
+
+    @property
+    def control_rate(self) -> float:
+        """Get control loop rate in Hz."""
+        return self._config['control_rate']
+
+    @property
+    def groups(self) -> Dict[str, List[int]]:
+        """Get motor groupings."""
+        return self._config['groups']
+
+    @property
+    def motors(self) -> Dict[int, MotorConfig]:
+        """Get motor configurations."""
+        return self._config['motors']
+
+    def get_motor_config(self, motor_id: int) -> MotorConfig:
+        """
+        Get configuration for specific motor.
+
+        Args:
+            motor_id: Motor ID (1-12)
+
+        Returns:
+            MotorConfig for the specified motor
+        """
+        return self._config['motors'].get(motor_id, MotorConfig())
+
+
+def _load_motor_config(config_path: Optional[str] = None) -> Dict:
     """
     Load motor configuration from JSON file.
 
-    Config file format:
-    {
-        "control": {"rate_hz": 100.0},
-        "groups": {"hip": [1,4,7,10], "thigh": [2,5,8,11], "calf": [3,6,9,12], ...},
-        "motors": {
-            "1": {"initial_position": 2048, "kp": 6.25, "kd": 0.0, "min_position": 1024, "max_position": 3072},
-            ...
-        }
-    }
-
-    Note: kp and kd are ACTUAL values (not raw). Conversions:
-        - raw_kp = kp × 128
-        - raw_kd = kd × 16
+    Deprecated: Use MotorConfigManager directly instead.
+    This function is kept for backward compatibility.
 
     Args:
         config_path: Path to JSON config file. If None, looks for 'motor_config.json'
@@ -104,75 +337,12 @@ def _load_motor_config(config_path=None):
     Returns:
         Dictionary with 'control_rate', 'groups', and 'motors'
     """
-    # Default configuration
-    default_config = {
-        'control_rate': 100.0,
-        'groups': {
-            'hip': [1, 4, 7, 10],
-            'thigh': [2, 5, 8, 11],
-            'calf': [3, 6, 9, 12],
-            'front_left_leg': [1, 2, 3],
-            'rear_left_leg': [4, 5, 6],
-            'rear_right_leg': [7, 8, 9],
-            'front_right_leg': [10, 11, 12],
-            'left_side': [1, 2, 3, 4, 5, 6],
-            'right_side': [7, 8, 9, 10, 11, 12]
-        },
-        'motors': {}
+    manager = MotorConfigManager(config_path)
+    return {
+        'control_rate': manager.control_rate,
+        'groups': manager.groups,
+        'motors': manager.motors
     }
-
-    # Initialize default motor configs (1-12)
-    for motor_id in range(1, 13):
-        default_config['motors'][motor_id] = {
-            'initial_position': 2048,
-            'kp': 6.25,  # Actual Kp value (raw = 800)
-            'kd': 0.0,   # Actual Kd value (raw = 0)
-            'min_position': 1024,
-            'max_position': 3072
-        }
-
-    # Determine config file path
-    if config_path is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(script_dir, 'motor_config.json')
-
-    # Try to load from file
-    if not os.path.exists(config_path):
-        print(f"[CONFIG] Config file not found: {config_path}")
-        print(f"[CONFIG] Using built-in defaults")
-        return default_config
-
-    try:
-        with open(config_path, 'r') as f:
-            file_config = json.load(f)
-
-        # Extract control rate
-        if 'control' in file_config:
-            default_config['control_rate'] = file_config['control'].get('rate_hz', 100.0)
-
-        # Load motor groups
-        if 'groups' in file_config:
-            default_config['groups'].update(file_config['groups'])
-
-        # Load motor configurations
-        if 'motors' in file_config:
-            for motor_id_str, motor_data in file_config['motors'].items():
-                motor_id = int(motor_id_str)
-                # Update default with file values
-                default_config['motors'][motor_id].update(motor_data)
-
-        print(f"[CONFIG] Loaded configuration from: {config_path}")
-        print(f"[CONFIG] Control rate: {default_config['control_rate']} Hz")
-        return default_config
-
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] Failed to parse config file: {e}")
-        print(f"[CONFIG] Using built-in defaults")
-        return default_config
-    except Exception as e:
-        print(f"[ERROR] Failed to load config file: {e}")
-        print(f"[CONFIG] Using built-in defaults")
-        return default_config
 
 
 class MX64Controller:
@@ -277,13 +447,13 @@ class MX64Controller:
         7: 4500000,
     }
 
-    # Operating modes
-    OPERATING_MODE_CURRENT = 0
-    OPERATING_MODE_VELOCITY = 1
-    OPERATING_MODE_POSITION = 3
-    OPERATING_MODE_EXTENDED_POSITION = 4
-    OPERATING_MODE_CURRENT_BASED_POSITION = 5
-    OPERATING_MODE_PWM = 16
+    # Operating modes (use OperatingMode enum for type safety)
+    OPERATING_MODE_CURRENT = OperatingMode.CURRENT
+    OPERATING_MODE_VELOCITY = OperatingMode.VELOCITY
+    OPERATING_MODE_POSITION = OperatingMode.POSITION
+    OPERATING_MODE_EXTENDED_POSITION = OperatingMode.EXTENDED_POSITION
+    OPERATING_MODE_CURRENT_BASED_POSITION = OperatingMode.CURRENT_BASED_POSITION
+    OPERATING_MODE_PWM = OperatingMode.PWM
 
     # Position constants - Standard Position Control Mode (mode 3)
     POSITION_MIN = 0
@@ -298,11 +468,17 @@ class MX64Controller:
     # Conversion constants
     POSITION_TO_DEGREES = 360.0 / 4096.0  # ~0.088 degrees per unit
     DEGREES_TO_POSITION = 4096.0 / 360.0
-    POSITION_TO_RADIANS = 3.14159265359 * 2 / 4096.0
-    RADIANS_TO_POSITION = 4096.0 / (3.14159265359 * 2)
+    POSITION_TO_RADIANS = math.tau / 4096.0  # tau = 2π
+    RADIANS_TO_POSITION = 4096.0 / math.tau
 
     # Units per revolution (for extended mode calculations)
     UNITS_PER_REVOLUTION = 4096
+
+    # PID gain conversion factors (actual to raw)
+    KP_CONVERSION_FACTOR = 128      # raw_kp = kp_actual × 128
+    KI_CONVERSION_FACTOR = 65536    # raw_ki = ki_actual × 65536
+    KD_CONVERSION_FACTOR = 16       # raw_kd = kd_actual × 16
+    MAX_GAIN_RAW = 16383            # Maximum raw gain value (0-16383)
 
     # Default ports to scan
     DEFAULT_PORTS = ['/dev/ttyUSB0', '/dev/ttyUSB1']
@@ -333,8 +509,6 @@ class MX64Controller:
 
         # Load configuration from JSON file
         self._config = _load_motor_config(config_path)
-        self.control_rate = self._config['control_rate']
-        self.groups = self._config['groups']
 
         # Discovered motors cache
         self.discovered_motors = {}  # {id: (model_number, firmware_version)}
@@ -361,6 +535,40 @@ class MX64Controller:
 
         if auto_connect:
             self.connect()
+
+    # ==================== Internal Helper Methods ====================
+
+    def _resolve_motor_id(self, motor_id: Optional[int]) -> int:
+        """
+        Resolve motor ID to actual value.
+
+        Args:
+            motor_id: Motor ID or None to use self.motor_id
+
+        Returns:
+            Resolved motor ID
+        """
+        return motor_id if motor_id is not None else self.motor_id
+
+    @property
+    def control_rate(self) -> float:
+        """
+        Control loop rate in Hz from configuration.
+
+        Returns:
+            Control rate in Hz
+        """
+        return self._config['control_rate']
+
+    @property
+    def groups(self) -> Dict[str, List[int]]:
+        """
+        Motor groupings from configuration.
+
+        Returns:
+            Dictionary mapping group names to lists of motor IDs
+        """
+        return self._config['groups']
 
     # ==================== Connection Methods ====================
 
@@ -486,7 +694,7 @@ class MX64Controller:
 
     # ==================== Configuration Methods ====================
 
-    def initialize(self, expected_motors=12):
+    def initialize(self, expected_motors: int = 12) -> Optional[List[int]]:
         """
         Full initialization sequence for robot startup.
 
@@ -510,13 +718,48 @@ class MX64Controller:
             expected_motors: Expected number of motors (default: 12)
 
         Returns:
-            list: List of discovered motor IDs if successful, None if failed
+            List of discovered motor IDs if successful, None if failed
         """
         print("\n" + "=" * 60)
         print("   Motor Initialization")
         print("=" * 60)
 
-        # Step 1: Connect
+        if not self._connect_to_motors():
+            return None
+
+        motor_ids = self._discover_and_verify_motors(expected_motors)
+        if motor_ids is None:
+            return None
+
+        if not self._apply_configuration(motor_ids):
+            self.disconnect()
+            return None
+
+        if not self._setup_sync_communication(motor_ids):
+            self.disconnect()
+            return None
+
+        if not self._read_initial_state(motor_ids):
+            self.disconnect()
+            return None
+
+        if not self._enable_all_torques(motor_ids):
+            self.disconnect()
+            return None
+
+        print("\n" + "=" * 60)
+        print(f"[SUCCESS] Initialization complete - {len(motor_ids)} motors ready")
+        print("=" * 60)
+
+        return motor_ids
+
+    def _connect_to_motors(self) -> bool:
+        """
+        Step 1: Connect to motors via serial port.
+
+        Returns:
+            True if connection successful, False otherwise
+        """
         print("\n[STEP 1] Connecting to motors...")
         print("-" * 40)
 
@@ -526,9 +769,20 @@ class MX64Controller:
             print("  - Motors are powered (12V)")
             print("  - USB cable is connected")
             print("  - Correct permissions on /dev/ttyUSB*")
-            return None
+            return False
 
-        # Step 2: Discover motors
+        return True
+
+    def _discover_and_verify_motors(self, expected: int) -> Optional[List[int]]:
+        """
+        Steps 2-3: Discover motors and verify count.
+
+        Args:
+            expected: Expected number of motors
+
+        Returns:
+            List of motor IDs if successful, None if failed
+        """
         print("\n[STEP 2] Discovering motors...")
         print("-" * 40)
 
@@ -542,39 +796,67 @@ class MX64Controller:
         motor_ids = sorted(motors.keys())
         print(f"\nFound {len(motor_ids)} motor(s): {motor_ids}")
 
-        # Step 3: Verify motor count
         print("\n[STEP 3] Verifying motor count...")
         print("-" * 40)
 
-        if len(motor_ids) != expected_motors:
-            print(f"[WARNING] Expected {expected_motors} motors, found {len(motor_ids)}")
-            print(f"  Missing motors: {[m for m in range(1, expected_motors + 1) if m not in motor_ids]}")
+        if len(motor_ids) != expected:
+            print(f"[WARNING] Expected {expected} motors, found {len(motor_ids)}")
+            print(f"  Missing motors: {[m for m in range(1, expected + 1) if m not in motor_ids]}")
             self.disconnect()
             return None
 
-        print(f"[OK] All {expected_motors} motors found")
+        print(f"[OK] All {expected} motors found")
+        return motor_ids
 
-        # Step 4: Apply PID configuration
+    def _apply_configuration(self, motor_ids: List[int]) -> bool:
+        """
+        Step 4: Apply PID gains from config file.
+
+        Args:
+            motor_ids: List of motor IDs to configure
+
+        Returns:
+            True if configuration successful, False otherwise
+        """
         print("\n[STEP 4] Applying PID gains from config...")
         print("-" * 40)
 
         if not self.apply_pid_config(motor_ids):
             print("[FAILED] Could not apply PID configuration")
-            self.disconnect()
-            return None
+            return False
 
-        # Step 5: Initialize GroupSync
+        return True
+
+    def _setup_sync_communication(self, motor_ids: List[int]) -> bool:
+        """
+        Step 5: Initialize GroupSync for efficient multi-motor communication.
+
+        Args:
+            motor_ids: List of motor IDs to register for sync operations
+
+        Returns:
+            True if GroupSync initialized successfully, False otherwise
+        """
         print("\n[STEP 5] Initializing GroupSync...")
         print("-" * 40)
 
         if not self.init_sync(motor_ids):
             print("[FAILED] Could not initialize GroupSync")
-            self.disconnect()
-            return None
+            return False
 
         print("[OK] GroupSync ready - all motors read/write in ONE packet")
+        return True
 
-        # Step 6: Read initial positions
+    def _read_initial_state(self, motor_ids: List[int]) -> bool:
+        """
+        Step 6: Read and store initial positions from all motors.
+
+        Args:
+            motor_ids: List of motor IDs to read from
+
+        Returns:
+            True if all positions read successfully, False otherwise
+        """
         print("\n[STEP 6] Reading initial positions...")
         print("-" * 40)
 
@@ -588,14 +870,24 @@ class MX64Controller:
                     positions[mid] = pos
                 else:
                     print(f"[FAILED] Could not read position for motor {mid}")
-                    self.disconnect()
-                    return None
+                    return False
 
         self.initial_positions = positions.copy()
         for mid in motor_ids:
             print(f"  Motor {mid:2d}: {self.initial_positions[mid]:5d} raw")
 
-        # Step 7: Enable torque on all motors
+        return True
+
+    def _enable_all_torques(self, motor_ids: List[int]) -> bool:
+        """
+        Step 7: Enable torque on all motors.
+
+        Args:
+            motor_ids: List of motor IDs to enable torque for
+
+        Returns:
+            True if all torques enabled successfully, False otherwise
+        """
         print("\n[STEP 7] Enabling torque on all motors...")
         print("-" * 40)
 
@@ -604,16 +896,11 @@ class MX64Controller:
                 print(f"  Motor {mid:2d}: Torque ON [OK]")
             else:
                 print(f"  Motor {mid:2d}: Torque ON [FAILED]")
-                self.disconnect()
-                return None
+                return False
 
-        print("\n" + "=" * 60)
-        print(f"[SUCCESS] Initialization complete - {len(motor_ids)} motors ready")
-        print("=" * 60)
+        return True
 
-        return motor_ids
-
-    def apply_pid_config(self, motor_ids=None):
+    def apply_pid_config(self, motor_ids: Optional[List[int]] = None) -> bool:
         """
         Apply PID gains (Kp, Kd) from config file to specified motors.
 
@@ -629,7 +916,7 @@ class MX64Controller:
             motor_ids: List of motor IDs to configure. If None, uses discovered motors.
 
         Returns:
-            bool: True if all motors configured successfully
+            True if all motors configured successfully
         """
         if motor_ids is None:
             motor_ids = list(self.discovered_motors.keys())
@@ -641,30 +928,17 @@ class MX64Controller:
         fail_count = 0
 
         for mid in motor_ids:
-            motor_config = self._config['motors'].get(mid, {})
+            motor_config = self._config['motors'].get(mid, MotorConfig())
 
-            # Read actual Kp/Kd values from config
-            kp_actual = motor_config.get('kp', 6.25)
-            kd_actual = motor_config.get('kd', 0.0)
+            kp_actual = motor_config.kp
+            kd_actual = motor_config.kd
+            kp_raw = motor_config.kp_raw
+            kd_raw = motor_config.kd_raw
 
-            # Convert actual values to raw register values
-            # Kp: raw = actual × 128
-            # Kd: raw = actual × 16
-            kp_raw = int(round(kp_actual * 128))
-            kd_raw = int(round(kd_actual * 16))
-
-            # Clamp to valid range (0-16383)
-            kp_raw = max(0, min(16383, kp_raw))
-            kd_raw = max(0, min(16383, kd_raw))
-
-            # PID gains require torque off
-            torque_was_on = self.get_torque(mid)
-            if torque_was_on:
-                self.set_torque(False, mid)
-
-            # Write P and D gains (raw values)
-            p_success = self.write_2_bytes(self.ADDR_POSITION_P_GAIN, kp_raw, mid)
-            d_success = self.write_2_bytes(self.ADDR_POSITION_D_GAIN, kd_raw, mid)
+            # PID gains require torque off - use context manager for safe restore
+            with self.torque_disabled(mid):
+                p_success = self.write_2_bytes(self.ADDR_POSITION_P_GAIN, kp_raw, mid)
+                d_success = self.write_2_bytes(self.ADDR_POSITION_D_GAIN, kd_raw, mid)
 
             if p_success and d_success:
                 print(f"  Motor {mid:2d}: Kp={kp_actual:6.2f} (raw={kp_raw:4d}), Kd={kd_actual:6.2f} (raw={kd_raw:4d}) [OK]")
@@ -672,10 +946,6 @@ class MX64Controller:
             else:
                 print(f"  Motor {mid:2d}: Kp={kp_actual:6.2f} (raw={kp_raw:4d}), Kd={kd_actual:6.2f} (raw={kd_raw:4d}) [FAILED]")
                 fail_count += 1
-
-            # Restore torque state
-            if torque_was_on:
-                self.set_torque(True, mid)
 
         print(f"\n[CONFIG] Applied PID to {success_count}/{len(motor_ids)} motors", end="")
         if fail_count > 0:
@@ -696,10 +966,10 @@ class MX64Controller:
         Returns:
             int: Clamped position within configured limits
         """
-        mid = motor_id if motor_id is not None else self.motor_id
-        motor_config = self._config['motors'].get(mid, {})
-        min_pos = motor_config.get('min_position', 1024)
-        max_pos = motor_config.get('max_position', 3072)
+        mid = self._resolve_motor_id(motor_id)
+        motor_config = self._config['motors'].get(mid, MotorConfig())
+        min_pos = motor_config.min_position
+        max_pos = motor_config.max_position
 
         # For extended position mode, use hardware limits instead of config limits
         if self.is_extended_position_mode(mid):
@@ -715,7 +985,7 @@ class MX64Controller:
         Returns:
             dict: {motor_id: initial_position}
         """
-        return {mid: motor.get('initial_position', 2048)
+        return {mid: motor.initial_position
                 for mid, motor in self._config['motors'].items()}
 
     def move_to_initial_positions(self, motor_ids=None):
@@ -780,10 +1050,11 @@ class MX64Controller:
                           f"{self.packet_handler.getTxRxResult(comm_result)}")
                 return {}
 
-            # Cache results
-            self.discovered_motors = {}
-            for motor_id, (model_num, fw_version) in data_list.items():
-                self.discovered_motors[motor_id] = (model_num, fw_version)
+            # Cache results using dict comprehension
+            self.discovered_motors = {
+                motor_id: (model_num, fw_version)
+                for motor_id, (model_num, fw_version) in data_list.items()
+            }
 
             if verbose and self.discovered_motors:
                 print(f"\n[SCAN] Found {len(self.discovered_motors)} motor(s):")
@@ -810,7 +1081,7 @@ class MX64Controller:
         if not self.port_handler:
             return None
 
-        mid = motor_id if motor_id is not None else self.motor_id
+        mid = self._resolve_motor_id(motor_id)
 
         try:
             model_num, comm_result, error = self.packet_handler.ping(
@@ -847,13 +1118,35 @@ class MX64Controller:
 
     # ==================== Low-Level Read/Write ====================
 
-    def read_1_byte(self, address, motor_id=None):
-        """Read 1 byte from control table."""
-        mid = motor_id if motor_id is not None else self.motor_id
+    def _read_bytes(self, address: int, num_bytes: int, motor_id: Optional[int] = None) -> Optional[int]:
+        """
+        Generic read method for 1, 2, or 4 bytes from control table.
+
+        Args:
+            address: Control table address
+            num_bytes: Number of bytes to read (1, 2, or 4)
+            motor_id: Motor ID (uses self.motor_id if None)
+
+        Returns:
+            Value read, or None on error
+        """
+        mid = self._resolve_motor_id(motor_id)
         self.stats['read_count'] += 1
 
+        # Map num_bytes to the appropriate read method
+        read_methods = {
+            1: self.packet_handler.read1ByteTxRx,
+            2: self.packet_handler.read2ByteTxRx,
+            4: self.packet_handler.read4ByteTxRx
+        }
+
+        if num_bytes not in read_methods:
+            print(f"[ERROR] Invalid num_bytes: {num_bytes}. Must be 1, 2, or 4.")
+            self.stats['read_errors'] += 1
+            return None
+
         try:
-            value, comm_result, error = self.packet_handler.read1ByteTxRx(
+            value, comm_result, error = read_methods[num_bytes](
                 self.port_handler, mid, address
             )
 
@@ -863,57 +1156,80 @@ class MX64Controller:
 
             return value
 
-        except Exception:
+        except Exception as e:
+            print(f"[ERROR] Read failed: motor={mid}, addr={address}, bytes={num_bytes}, error={e}")
             self.stats['read_errors'] += 1
             return None
 
-    def read_2_bytes(self, address, motor_id=None):
-        """Read 2 bytes from control table."""
-        mid = motor_id if motor_id is not None else self.motor_id
-        self.stats['read_count'] += 1
+    def read_1_byte(self, address: int, motor_id: Optional[int] = None) -> Optional[int]:
+        """
+        Read 1 byte from motor control table.
 
-        try:
-            value, comm_result, error = self.packet_handler.read2ByteTxRx(
-                self.port_handler, mid, address
-            )
+        Args:
+            address: Control table address to read
+            motor_id: Motor ID (uses self.motor_id if None)
 
-            if comm_result != COMM_SUCCESS or error != 0:
-                self.stats['read_errors'] += 1
-                return None
+        Returns:
+            Byte value, or None on error
+        """
+        return self._read_bytes(address, 1, motor_id)
 
-            return value
+    def read_2_bytes(self, address: int, motor_id: Optional[int] = None) -> Optional[int]:
+        """
+        Read 2 bytes from motor control table.
 
-        except Exception:
-            self.stats['read_errors'] += 1
-            return None
+        Args:
+            address: Control table address to read
+            motor_id: Motor ID (uses self.motor_id if None)
 
-    def read_4_bytes(self, address, motor_id=None):
-        """Read 4 bytes from control table."""
-        mid = motor_id if motor_id is not None else self.motor_id
-        self.stats['read_count'] += 1
+        Returns:
+            2-byte value, or None on error
+        """
+        return self._read_bytes(address, 2, motor_id)
 
-        try:
-            value, comm_result, error = self.packet_handler.read4ByteTxRx(
-                self.port_handler, mid, address
-            )
+    def read_4_bytes(self, address: int, motor_id: Optional[int] = None) -> Optional[int]:
+        """
+        Read 4 bytes from motor control table.
 
-            if comm_result != COMM_SUCCESS or error != 0:
-                self.stats['read_errors'] += 1
-                return None
+        Args:
+            address: Control table address to read
+            motor_id: Motor ID (uses self.motor_id if None)
 
-            return value
+        Returns:
+            4-byte value, or None on error
+        """
+        return self._read_bytes(address, 4, motor_id)
 
-        except Exception:
-            self.stats['read_errors'] += 1
-            return None
+    def _write_bytes(self, address: int, num_bytes: int, value: int, motor_id: Optional[int] = None) -> bool:
+        """
+        Generic write method for 1, 2, or 4 bytes to control table.
 
-    def write_1_byte(self, address, value, motor_id=None):
-        """Write 1 byte to control table."""
-        mid = motor_id if motor_id is not None else self.motor_id
+        Args:
+            address: Control table address
+            num_bytes: Number of bytes to write (1, 2, or 4)
+            value: Value to write
+            motor_id: Motor ID (uses self.motor_id if None)
+
+        Returns:
+            True on success, False on error
+        """
+        mid = self._resolve_motor_id(motor_id)
         self.stats['write_count'] += 1
 
+        # Map num_bytes to the appropriate write method
+        write_methods = {
+            1: self.packet_handler.write1ByteTxRx,
+            2: self.packet_handler.write2ByteTxRx,
+            4: self.packet_handler.write4ByteTxRx
+        }
+
+        if num_bytes not in write_methods:
+            print(f"[ERROR] Invalid num_bytes: {num_bytes}. Must be 1, 2, or 4.")
+            self.stats['write_errors'] += 1
+            return False
+
         try:
-            comm_result, error = self.packet_handler.write1ByteTxRx(
+            comm_result, error = write_methods[num_bytes](
                 self.port_handler, mid, address, value
             )
 
@@ -923,49 +1239,52 @@ class MX64Controller:
 
             return True
 
-        except Exception:
+        except Exception as e:
+            print(f"[ERROR] Write failed: motor={mid}, addr={address}, value={value}, bytes={num_bytes}, error={e}")
             self.stats['write_errors'] += 1
             return False
 
-    def write_2_bytes(self, address, value, motor_id=None):
-        """Write 2 bytes to control table."""
-        mid = motor_id if motor_id is not None else self.motor_id
-        self.stats['write_count'] += 1
+    def write_1_byte(self, address: int, value: int, motor_id: Optional[int] = None) -> bool:
+        """
+        Write 1 byte to motor control table.
 
-        try:
-            comm_result, error = self.packet_handler.write2ByteTxRx(
-                self.port_handler, mid, address, value
-            )
+        Args:
+            address: Control table address to write
+            value: Value to write (0-255)
+            motor_id: Motor ID (uses self.motor_id if None)
 
-            if comm_result != COMM_SUCCESS or error != 0:
-                self.stats['write_errors'] += 1
-                return False
+        Returns:
+            True on success, False on error
+        """
+        return self._write_bytes(address, 1, value, motor_id)
 
-            return True
+    def write_2_bytes(self, address: int, value: int, motor_id: Optional[int] = None) -> bool:
+        """
+        Write 2 bytes to motor control table.
 
-        except Exception:
-            self.stats['write_errors'] += 1
-            return False
+        Args:
+            address: Control table address to write
+            value: Value to write (0-65535)
+            motor_id: Motor ID (uses self.motor_id if None)
 
-    def write_4_bytes(self, address, value, motor_id=None):
-        """Write 4 bytes to control table."""
-        mid = motor_id if motor_id is not None else self.motor_id
-        self.stats['write_count'] += 1
+        Returns:
+            True on success, False on error
+        """
+        return self._write_bytes(address, 2, value, motor_id)
 
-        try:
-            comm_result, error = self.packet_handler.write4ByteTxRx(
-                self.port_handler, mid, address, value
-            )
+    def write_4_bytes(self, address: int, value: int, motor_id: Optional[int] = None) -> bool:
+        """
+        Write 4 bytes to motor control table.
 
-            if comm_result != COMM_SUCCESS or error != 0:
-                self.stats['write_errors'] += 1
-                return False
+        Args:
+            address: Control table address to write
+            value: Value to write
+            motor_id: Motor ID (uses self.motor_id if None)
 
-            return True
-
-        except Exception:
-            self.stats['write_errors'] += 1
-            return False
+        Returns:
+            True on success, False on error
+        """
+        return self._write_bytes(address, 4, value, motor_id)
 
     # ==================== High-Level Motor Control ====================
 
@@ -986,6 +1305,31 @@ class MX64Controller:
         """Get torque enable status."""
         value = self.read_1_byte(self.ADDR_TORQUE_ENABLE, motor_id)
         return value == 1 if value is not None else None
+
+    @contextmanager
+    def torque_disabled(self, motor_id: int):
+        """
+        Context manager to temporarily disable torque and restore on exit.
+
+        Ensures torque is restored even if an error occurs during the operation.
+        Useful for operations that require torque to be OFF (like PID configuration).
+
+        Args:
+            motor_id: Motor ID to disable torque for
+
+        Usage:
+            with controller.torque_disabled(motor_id):
+                controller.write_2_bytes(addr, value, motor_id)
+                # Torque automatically restored on exit
+        """
+        was_on = self.get_torque(motor_id)
+        if was_on:
+            self.set_torque(False, motor_id)
+        try:
+            yield
+        finally:
+            if was_on:
+                self.set_torque(True, motor_id)
 
     def set_led(self, on, motor_id=None):
         """Turn LED on or off."""
@@ -1010,7 +1354,7 @@ class MX64Controller:
         Read raw 4-byte position value (internal use).
         Handles signed conversion for extended position mode.
         """
-        mid = motor_id if motor_id is not None else self.motor_id
+        mid = self._resolve_motor_id(motor_id)
         value = self.read_4_bytes(self.ADDR_PRESENT_POSITION, mid)
 
         if value is None:
@@ -1023,19 +1367,22 @@ class MX64Controller:
 
         return value
 
-    def read_position(self, motor_id=None):
+    def read_position(self, motor_id: Optional[int] = None) -> Optional[int]:
         """
         Read current position in raw units.
 
         In Position Control Mode (3): Returns 0-4095
         In Extended Position Mode (4): Returns signed value (can be negative)
 
+        Args:
+            motor_id: Motor ID (uses self.motor_id if None)
+
         Returns:
-            int: Position value or None on error
+            Position value or None on error
         """
         return self._read_position_raw(motor_id)
 
-    def write_position(self, position, motor_id=None):
+    def write_position(self, position: int, motor_id: Optional[int] = None) -> bool:
         """
         Write goal position in raw units.
 
@@ -1049,9 +1396,9 @@ class MX64Controller:
             motor_id: Motor ID (uses self.motor_id if None)
 
         Returns:
-            bool: Success status
+            Success status
         """
-        mid = motor_id if motor_id is not None else self.motor_id
+        mid = self._resolve_motor_id(motor_id)
         position = int(position)
 
         # Validate position against configured limits
@@ -1105,7 +1452,7 @@ class MX64Controller:
 
     def read_goal_position(self, motor_id=None):
         """Read goal position in raw units."""
-        mid = motor_id if motor_id is not None else self.motor_id
+        mid = self._resolve_motor_id(motor_id)
         value = self.read_4_bytes(self.ADDR_GOAL_POSITION, mid)
 
         if value is None:
@@ -1175,7 +1522,7 @@ class MX64Controller:
         print(f"[INFO] GroupSync initialized for motors: {self._sync_motor_ids}")
         return True
 
-    def sync_write_positions(self, positions_dict):
+    def sync_write_positions(self, positions_dict: Dict[int, int]) -> bool:
         """
         Write goal positions to multiple motors in ONE packet.
         All motors receive the command simultaneously.
@@ -1185,7 +1532,7 @@ class MX64Controller:
                            Example: {1: 2048, 2: 3000, 3: 1500}
 
         Returns:
-            bool: True if successful
+            True if successful
         """
         if self._sync_write_position is None:
             print("[ERROR] Sync not initialized. Call init_sync() first.")
@@ -1231,7 +1578,7 @@ class MX64Controller:
 
         return True
 
-    def sync_read_positions(self, max_retries=3, retry_delay=0.005):
+    def sync_read_positions(self, max_retries: int = 3, retry_delay: float = 0.005) -> Optional[Dict[int, int]]:
         """
         Read current positions from all registered motors in ONE packet.
 
@@ -1240,11 +1587,8 @@ class MX64Controller:
             retry_delay: Delay between retries in seconds (default: 5ms)
 
         Returns:
-            dict: {motor_id: position} or None on error
-                  Example: {1: 2048, 2: 3000, 3: 1500}
+            {motor_id: position} or None on error. Example: {1: 2048, 2: 3000, 3: 1500}
         """
-        import time
-
         if self._sync_read_position is None:
             print("[ERROR] Sync not initialized. Call init_sync() first.")
             return None
@@ -1368,7 +1712,7 @@ class MX64Controller:
         Returns:
             bool: Success status
         """
-        mid = motor_id if motor_id is not None else self.motor_id
+        mid = self._resolve_motor_id(motor_id)
 
         # Read current position
         current_pos = self.read_position(mid)
@@ -1505,7 +1849,7 @@ class MX64Controller:
             - 5: Current-based Position Control
             - 16: PWM Control
         """
-        mid = motor_id if motor_id is not None else self.motor_id
+        mid = self._resolve_motor_id(motor_id)
         mode = self.read_1_byte(self.ADDR_OPERATING_MODE, mid)
         if mode is not None:
             self._operating_mode_cache[mid] = mode
@@ -1524,7 +1868,7 @@ class MX64Controller:
         Returns:
             bool: Success status
         """
-        mid = motor_id if motor_id is not None else self.motor_id
+        mid = self._resolve_motor_id(motor_id)
 
         # Check if torque needs to be disabled
         torque_was_enabled = self.get_torque(mid)
@@ -1603,7 +1947,7 @@ class MX64Controller:
         Returns:
             bool: True if in extended position mode
         """
-        mid = motor_id if motor_id is not None else self.motor_id
+        mid = self._resolve_motor_id(motor_id)
 
         # Use cached value if available, otherwise read
         if mid in self._operating_mode_cache:
@@ -1612,34 +1956,40 @@ class MX64Controller:
         mode = self.get_operating_mode(mid)
         return mode == self.OPERATING_MODE_EXTENDED_POSITION
 
-    def get_motor_info(self, motor_id=None):
+    def get_motor_info(self, motor_id: Optional[int] = None) -> MotorInfo:
         """
         Get comprehensive motor information.
 
+        Args:
+            motor_id: Motor ID (uses self.motor_id if None)
+
         Returns:
-            dict: Motor information
+            MotorInfo: Structured motor information with type safety
         """
-        mid = motor_id if motor_id is not None else self.motor_id
+        mid = self._resolve_motor_id(motor_id)
 
-        return {
-            'id': mid,
-            'model_number': self.read_2_bytes(self.ADDR_MODEL_NUMBER, mid),
-            'firmware_version': self.read_1_byte(self.ADDR_FIRMWARE_VERSION, mid),
-            'baud_rate': self.read_1_byte(self.ADDR_BAUD_RATE, mid),
-            'operating_mode': self.get_operating_mode(mid),
-            'torque_enabled': self.get_torque(mid),
-            'led_on': self.get_led(mid),
-            'temperature_c': self.read_temperature(mid),
-            'voltage_v': self.read_voltage_v(mid),
-            'position': self.read_position(mid),
-            'velocity': self.read_velocity(mid),
-            'current_ma': self.read_current_ma(mid),
-            'hardware_error': self.get_hardware_error(mid),
-        }
+        return MotorInfo(
+            model=self.read_2_bytes(self.ADDR_MODEL_NUMBER, mid) or 0,
+            firmware=self.read_1_byte(self.ADDR_FIRMWARE_VERSION, mid) or 0,
+            operating_mode=self.get_operating_mode(mid) or 0,
+            temperature=self.read_temperature(mid) or 0,
+            voltage=self.read_voltage_v(mid) or 0.0,
+            position=self.read_position(mid) or 0,
+            velocity=self.read_velocity(mid) or 0,
+            current=self.read_current_ma(mid) or 0,
+            is_moving=self.is_moving(mid) or False,
+            hardware_error=self.get_hardware_error(mid) or 0,
+        )
 
-    def print_status(self, motor_id=None):
-        """Print formatted motor status."""
+    def print_status(self, motor_id: Optional[int] = None):
+        """
+        Print formatted motor status.
+
+        Args:
+            motor_id: Motor ID (uses self.motor_id if None)
+        """
         info = self.get_motor_info(motor_id)
+        mid = self._resolve_motor_id(motor_id)
 
         mode_names = {
             0: 'Current Control',
@@ -1651,32 +2001,18 @@ class MX64Controller:
         }
 
         print(f"\n{'='*60}")
-        print(f"Motor ID {info['id']} Status")
+        print(f"Motor ID {mid} Status")
         print(f"{'='*60}")
-        print(f"Model Number:     {info['model_number']}")
-        print(f"Firmware Version: {info['firmware_version']}")
-        print(f"Baud Rate Index:  {info['baud_rate']}")
-        print(f"Operating Mode:   {mode_names.get(info['operating_mode'], info['operating_mode'])}")
-        print(f"Torque Enabled:   {'Yes' if info['torque_enabled'] else 'No'}")
-        print(f"LED:              {'On' if info['led_on'] else 'Off'}")
-        print(f"Temperature:      {info['temperature_c']}°C")
-        print(f"Voltage:          {info['voltage_v']:.1f}V" if info['voltage_v'] else "Voltage: N/A")
-
-        # Position display
-        if info['position'] is not None:
-            pos = info['position']
-            degrees = pos * self.POSITION_TO_DEGREES
-            print(f"Position:         {pos} raw ({degrees:.1f}°)")
-        else:
-            print(f"Position:         N/A")
-
-        print(f"Velocity:         {info['velocity']}")
-        print(f"Current:          {info['current_ma']:.1f} mA" if info['current_ma'] else "Current: N/A")
-
-        if info['hardware_error'] and info['hardware_error']['raw_value'] != 0:
-            print(f"Hardware Error:   {info['hardware_error']}")
-        else:
-            print(f"Hardware Error:   None")
+        print(f"Model Number:     {info.model}")
+        print(f"Firmware Version: {info.firmware}")
+        print(f"Operating Mode:   {mode_names.get(info.operating_mode, info.operating_mode)}")
+        print(f"Temperature:      {info.temperature}°C")
+        print(f"Voltage:          {info.voltage:.1f}V")
+        print(f"Position:         {info.position} raw ({info.position * self.POSITION_TO_DEGREES:.1f}°)")
+        print(f"Velocity:         {info.velocity}")
+        print(f"Current:          {info.current:.1f} mA")
+        print(f"Is Moving:        {'Yes' if info.is_moving else 'No'}")
+        print(f"Hardware Error:   {info.hardware_error if info.hardware_error != 0 else 'None'}")
         print(f"{'='*60}\n")
 
 
@@ -1684,8 +2020,6 @@ class MX64Controller:
 
 def main():
     """Test the controller with basic operations."""
-    import time
-
     print("MX-64 Controller Test")
     print("=" * 60)
 
