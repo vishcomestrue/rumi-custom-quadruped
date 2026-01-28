@@ -65,40 +65,14 @@ def run_sitstand(control_freq=5.0, duration=2.0, target_knee=500, target_hip=-20
 
     controller = MX64Controller()
 
-    # Step 1: Connect
-    print("\n[STEP 1] Scanning ports and connecting...")
-    print("-" * 40)
-
-    if not controller.connect():
-        print("\n[FAILED] Could not connect to any motors.")
-        print("Please check:")
-        print("  - Motors are powered (12V)")
-        print("  - USB cable is connected")
-        print("  - Correct permissions on /dev/ttyUSB*")
+    # Initialize: connect, discover, configure, enable torque (all in one!)
+    all_motor_ids = controller.initialize(expected_motors=12)
+    if all_motor_ids is None:
+        print("\n[FAILED] Initialization failed.")
         return
 
-    # Step 2: Discover all motors
-    print("\n[STEP 2] Discovering motors...")
-    print("-" * 40)
-
-    motors = controller.scan_motors(verbose=True)
-
-    if not motors:
-        print("[FAILED] No motors discovered.")
-        controller.disconnect()
-        return
-
-    all_motor_ids = sorted(motors.keys())
-    print(f"\nFound {len(all_motor_ids)} motor(s): {all_motor_ids}")
-
-    # Check if all 12 motors are present
-    if len(all_motor_ids) != 12:
-        print(f"\n[WARNING] Expected 12 motors, but found {len(all_motor_ids)}.")
-        response = input("Continue anyway? (y/N): ").strip().lower()
-        if response != 'y':
-            print("[INFO] Exiting as requested.")
-            controller.disconnect()
-            return
+    # Use the initial positions that were automatically read during initialization
+    reference_positions = controller.initial_positions.copy()
 
     # Filter to motors with IDs that are multiples of 3
     target_motor_ids = [mid for mid in all_motor_ids if mid % 3 == 0]
@@ -123,37 +97,6 @@ def run_sitstand(control_freq=5.0, duration=2.0, target_knee=500, target_hip=-20
     print(f"[INFO]   Group D (8, 11) -> {-target_hip:+d}r: {group_d}")
     print(f"[INFO] Other motors hold position: {[m for m in all_motor_ids if m not in target_motor_ids and m not in group_c and m not in group_d]}")
 
-    # Step 3: Initialize GroupSync
-    print("\n[STEP 3] Initializing GroupSync...")
-    print("-" * 40)
-
-    if not controller.init_sync(all_motor_ids):
-        print("[FAILED] Could not initialize GroupSync.")
-        controller.disconnect()
-        return
-
-    print("[OK] GroupSync initialized")
-
-    # Step 4: Read initial positions as REFERENCE POINTS
-    print("\n[STEP 4] Setting reference positions...")
-    print("-" * 40)
-
-    time.sleep(0.1)
-
-    positions = controller.sync_read_positions(max_retries=10, retry_delay=0.02)
-    if positions is None:
-        print("[WARNING] Sync read failed, trying individual reads...")
-        positions = {}
-        for mid in all_motor_ids:
-            pos = controller.read_position(mid)
-            if pos is not None:
-                positions[mid] = pos
-            else:
-                print(f"[ERROR] Failed to read position for motor {mid}")
-                controller.disconnect()
-                return
-
-    reference_positions = positions.copy()
     print("\nReference positions (STAND position):")
     for mid in all_motor_ids:
         ref_pos = reference_positions[mid]
@@ -168,21 +111,10 @@ def run_sitstand(control_freq=5.0, duration=2.0, target_knee=500, target_hip=-20
             marker = f" -> will go to {ref_pos - target_hip}r ({-target_hip:+d}r)"
         print(f"  Motor {mid}: {ref_pos} raw{marker}")
 
-    # Step 5: Enable torque on all motors
-    print("\n[STEP 5] Enabling torque on all motors...")
-    print("-" * 40)
-
-    for mid in all_motor_ids:
-        if controller.set_torque(True, mid):
-            print(f"[OK] Motor {mid}: Torque enabled")
-        else:
-            print(f"[ERROR] Motor {mid}: Failed to enable torque")
-            controller.disconnect()
-            return
-
-    # Step 6: Run sit-stand sequence
-    print("\n[STEP 6] Starting Sit-Stand Sequence")
-    print("-" * 40)
+    # Start sit-stand sequence
+    print("\n" + "=" * 60)
+    print("   Starting Sit-Stand Sequence")
+    print("=" * 60)
     print("Sequence: STAND -> SIT -> STAND")
     print(f"Frequency: {control_freq} Hz")
     print(f"Step sizes: sk={sk:.2f}, sh={sh:.2f} raw units per cycle")
