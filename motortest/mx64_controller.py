@@ -89,10 +89,14 @@ def _load_motor_config(config_path=None):
         "control": {"rate_hz": 100.0},
         "groups": {"hip": [1,4,7,10], "thigh": [2,5,8,11], "calf": [3,6,9,12], ...},
         "motors": {
-            "1": {"initial_position": 2048, "kp": 800, "kd": 0, "min_position": 1024, "max_position": 3072},
+            "1": {"initial_position": 2048, "kp": 6.25, "kd": 0.0, "min_position": 1024, "max_position": 3072},
             ...
         }
     }
+
+    Note: kp and kd are ACTUAL values (not raw). Conversions:
+        - raw_kp = kp × 128
+        - raw_kd = kd × 16
 
     Args:
         config_path: Path to JSON config file. If None, looks for 'motor_config.json'
@@ -121,8 +125,8 @@ def _load_motor_config(config_path=None):
     for motor_id in range(1, 13):
         default_config['motors'][motor_id] = {
             'initial_position': 2048,
-            'kp': 800,
-            'kd': 0,
+            'kp': 6.25,  # Actual Kp value (raw = 800)
+            'kd': 0.0,   # Actual Kd value (raw = 0)
             'min_position': 1024,
             'max_position': 3072
         }
@@ -613,6 +617,11 @@ class MX64Controller:
         """
         Apply PID gains (Kp, Kd) from config file to specified motors.
 
+        Config file stores ACTUAL Kp/Kd values (not raw). This method automatically
+        converts them to raw register values:
+            - raw_kp = kp × 128
+            - raw_kd = kd × 16
+
         Note: PID writes require torque to be OFF. This method will temporarily
         disable torque if needed and restore it afterwards.
 
@@ -633,23 +642,35 @@ class MX64Controller:
 
         for mid in motor_ids:
             motor_config = self._config['motors'].get(mid, {})
-            kp = motor_config.get('kp', 800)
-            kd = motor_config.get('kd', 0)
+
+            # Read actual Kp/Kd values from config
+            kp_actual = motor_config.get('kp', 6.25)
+            kd_actual = motor_config.get('kd', 0.0)
+
+            # Convert actual values to raw register values
+            # Kp: raw = actual × 128
+            # Kd: raw = actual × 16
+            kp_raw = int(round(kp_actual * 128))
+            kd_raw = int(round(kd_actual * 16))
+
+            # Clamp to valid range (0-16383)
+            kp_raw = max(0, min(16383, kp_raw))
+            kd_raw = max(0, min(16383, kd_raw))
 
             # PID gains require torque off
             torque_was_on = self.get_torque(mid)
             if torque_was_on:
                 self.set_torque(False, mid)
 
-            # Write P and D gains
-            p_success = self.write_2_bytes(self.ADDR_POSITION_P_GAIN, kp, mid)
-            d_success = self.write_2_bytes(self.ADDR_POSITION_D_GAIN, kd, mid)
+            # Write P and D gains (raw values)
+            p_success = self.write_2_bytes(self.ADDR_POSITION_P_GAIN, kp_raw, mid)
+            d_success = self.write_2_bytes(self.ADDR_POSITION_D_GAIN, kd_raw, mid)
 
             if p_success and d_success:
-                print(f"  Motor {mid:2d}: Kp={kp:4d}, Kd={kd:4d} [OK]")
+                print(f"  Motor {mid:2d}: Kp={kp_actual:6.2f} (raw={kp_raw:4d}), Kd={kd_actual:6.2f} (raw={kd_raw:4d}) [OK]")
                 success_count += 1
             else:
-                print(f"  Motor {mid:2d}: Kp={kp:4d}, Kd={kd:4d} [FAILED]")
+                print(f"  Motor {mid:2d}: Kp={kp_actual:6.2f} (raw={kp_raw:4d}), Kd={kd_actual:6.2f} (raw={kd_raw:4d}) [FAILED]")
                 fail_count += 1
 
             # Restore torque state
