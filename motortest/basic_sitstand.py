@@ -71,8 +71,12 @@ def run_sitstand(control_freq=5.0, duration=2.0, target_knee=500, target_hip=-20
         print("\n[FAILED] Initialization failed.")
         return
 
-    # Use the initial positions that were automatically read during initialization
-    reference_positions = controller.initial_positions.copy()
+    # Get home positions and initial offsets from initialization
+    home_positions = controller.get_home_positions()
+    initial_offsets = controller.initial_offsets.copy()
+
+    # Calculate reference positions (home + initial offsets)
+    reference_positions = {mid: home_positions[mid] + initial_offsets[mid] for mid in all_motor_ids}
 
     # Filter to motors with IDs that are multiples of 3
     target_motor_ids = [mid for mid in all_motor_ids if mid % 3 == 0]

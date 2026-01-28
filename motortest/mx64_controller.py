@@ -116,7 +116,7 @@ class MotorConfig:
     Motor configuration with type safety and automatic PID conversion.
 
     Attributes:
-        initial_position: Default motor position (0-4095 for MX-64)
+        home_position: Zero reference position for this motor (0-4095 for MX-64)
         kp: Actual Kp value (converted to raw: Kp × 128)
         kd: Actual Kd value (converted to raw: Kd × 16)
         min_position: Minimum allowed position
@@ -124,7 +124,7 @@ class MotorConfig:
         kp_raw: Cached raw Kp value for register writes
         kd_raw: Cached raw Kd value for register writes
     """
-    initial_position: int = 2048
+    home_position: int = 2048
     kp: float = 6.25
     kd: float = 0.0
     min_position: int = 1024
@@ -134,12 +134,12 @@ class MotorConfig:
 
     def update_from_dict(self, data: dict):
         """Update motor config from dictionary and recompute raw values."""
-        if 'initial_position' in data:
-            pos = data['initial_position']
+        if 'home_position' in data:
+            pos = data['home_position']
             if not (0 <= pos <= 4095):
-                print(f"[WARNING] Invalid initial_position {pos} (must be 0-4095), clamping")
+                print(f"[WARNING] Invalid home_position {pos} (must be 0-4095), clamping")
                 pos = max(0, min(4095, pos))
-            self.initial_position = pos
+            self.home_position = pos
 
         if 'kp' in data:
             kp = data['kp']
@@ -522,8 +522,8 @@ class MX64Controller:
         self._sync_write_position = None
         self._sync_motor_ids = []  # Motors registered for sync operations
 
-        # Initial positions read during initialize()
-        self.initial_positions = {}
+        # Initial offsets from home position (read during initialize())
+        self.initial_offsets = {}
 
         # Statistics
         self.stats = {
@@ -711,7 +711,7 @@ class MX64Controller:
             - All motors are connected and verified
             - PID gains are set from config
             - GroupSync is ready for fast read/write
-            - Initial positions are stored in self.initial_positions
+            - Initial offsets from home are stored in self.initial_offsets
             - Torque is ON - motors are holding position
 
         Args:
@@ -849,7 +849,7 @@ class MX64Controller:
 
     def _read_initial_state(self, motor_ids: List[int]) -> bool:
         """
-        Step 6: Read and store initial positions from all motors.
+        Step 6: Read and store initial offsets from home position.
 
         Args:
             motor_ids: List of motor IDs to read from
@@ -872,9 +872,15 @@ class MX64Controller:
                     print(f"[FAILED] Could not read position for motor {mid}")
                     return False
 
-        self.initial_positions = positions.copy()
+        # Calculate offsets from home position
+        self.initial_offsets = {}
         for mid in motor_ids:
-            print(f"  Motor {mid:2d}: {self.initial_positions[mid]:5d} raw")
+            motor_config = self._config['motors'].get(mid, MotorConfig())
+            home = motor_config.home_position
+            actual = positions[mid]
+            offset = actual - home
+            self.initial_offsets[mid] = offset
+            print(f"  Motor {mid:2d}: {actual:5d} raw (offset: {offset:+5d} from home {home})")
 
         return True
 
@@ -978,19 +984,19 @@ class MX64Controller:
 
         return max(min_pos, min(max_pos, position))
 
-    def get_initial_positions(self):
+    def get_home_positions(self):
         """
-        Get initial positions from configuration for all motors.
+        Get home positions from configuration for all motors.
 
         Returns:
-            dict: {motor_id: initial_position}
+            dict: {motor_id: home_position}
         """
-        return {mid: motor.initial_position
+        return {mid: motor.home_position
                 for mid, motor in self._config['motors'].items()}
 
-    def move_to_initial_positions(self, motor_ids=None):
+    def move_to_home_positions(self, motor_ids=None):
         """
-        Move specified motors to their configured initial positions.
+        Move specified motors to their configured home positions (zero reference).
 
         Args:
             motor_ids: List of motor IDs. If None, moves all discovered motors.
@@ -1004,14 +1010,14 @@ class MX64Controller:
                 print("[WARNING] No motors discovered. Call scan_motors() first.")
                 return False
 
-        initial_positions = self.get_initial_positions()
-        target_positions = {mid: initial_positions[mid] for mid in motor_ids if mid in initial_positions}
+        home_positions = self.get_home_positions()
+        target_positions = {mid: home_positions[mid] for mid in motor_ids if mid in home_positions}
 
         if not target_positions:
-            print("[WARNING] No initial positions configured for specified motors")
+            print("[WARNING] No home positions configured for specified motors")
             return False
 
-        print(f"\n[CONFIG] Moving {len(target_positions)} motor(s) to initial positions...")
+        print(f"\n[CONFIG] Moving {len(target_positions)} motor(s) to home positions...")
         for mid, pos in target_positions.items():
             print(f"  Motor {mid}: -> {pos} raw")
 
